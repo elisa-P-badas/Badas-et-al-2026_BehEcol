@@ -186,7 +186,7 @@ summarySEwithin <- function(data=NULL, measurevar, betweenvars=NULL, withinvars=
 ```{r final datasets}
 EFrepSENseen <- EFrepSENfinal_OK
 names(EFrepSENseen)
-EFrepSENseen <- as.data.frame(EFrepSENseen)
+EFrepSENdatasetsseen <- as.data.frame(EFrepSENseen)
 str(EFrepSENseen) # 759 obs. 291(?) individuals (Metal)
 EFrepSENseen[,c(2:4,7:12,14)] <- lapply(EFrepSENseen[,c(2:4,7:12,14)], factor)
 EFrepSENseen$yearF <- as.factor(EFrepSENseen$year)
