@@ -5,26 +5,3122 @@ date: "2026-01-07"
 output: html_document
 ---
 
-```{r packages}
-library(gitr)
+```{r packages and functions}
+library(lme4) 
+library(optimx)
+library(MuMIn)
+library(blme)
+library(lmerTest) 
+library(pbkrtest) 
+library(car)
+library(lmtest)
+library(psych)
+library(lattice)  
+library(arm)     
+library(phia)
+library(tidyverse)
+library(ggplot2)
+library(pROC)
+library(insight)
+library(RVAideMemoire)
+library(merTools)
+library(glmmTMB) 
+library(bbmle)
+library(smplot2)
+library(ggpubr)
+library(emmeans)
+library(brms)
+library(DHARMa)
+library(performance)
+library(emmeans)
+library(parameters)
+library(loo)
+library(ggeffects)
+library(ggtext)
+##
+vif.mer <- function (fit) {
+  ## adapted from rms::vif
+  v <- vcov(fit)
+  nam <- names(fixef(fit))
+  ## exclude intercepts
+  ns <- sum(1 * (nam == "Intercept" | nam == "(Intercept)"))
+  if (ns > 0) {
+    v <- v[-(1:ns), -(1:ns), drop = FALSE]
+    nam <- nam[-(1:ns)]
+  }
+  d <- diag(v)^0.5
+  v <- diag(solve(v/(d %o% d)))
+  names(v) <- nam
+  v
+}
+##
+##
+overdisp_fun <- function(model) {
+  rdf <- df.residual(model)
+  rp <- residuals(model,type="pearson")
+  Pearson.chisq <- sum(rp^2)
+  prat <- Pearson.chisq/rdf
+  pval <- pchisq(Pearson.chisq, df=rdf, lower.tail=FALSE)
+  c(chisq=Pearson.chisq,ratio=prat,rdf=rdf,p=pval)
+}
+##
+##
+summarySE <- function(data=NULL, measurevar, groupvars=NULL, na.rm=FALSE,
+                      conf.interval=.95, .drop=TRUE) {
+    library(plyr)
+
+    # New version of length which can handle NA's: if na.rm==T, don't count them
+    length2 <- function (x, na.rm=FALSE) {
+        if (na.rm) sum(!is.na(x))
+        else       length(x)
+    }
+
+    # This does the summary. For each group's data frame, return a vector with
+    # N, mean, and sd
+    datac <- ddply(data, groupvars, .drop=.drop,
+      .fun = function(xx, col) {
+        c(N    = length2(xx[[col]], na.rm=na.rm),
+          mean = mean   (xx[[col]], na.rm=na.rm),
+          sd   = sd     (xx[[col]], na.rm=na.rm)
+        )
+      },
+      measurevar
+    )
+
+    # Rename the "mean" column    
+    datac <- rename(datac, c("mean" = measurevar))
+
+    datac$se <- datac$sd / sqrt(datac$N)  # Calculate standard error of the mean
+
+    # Confidence interval multiplier for standard error
+    # Calculate t-statistic for confidence interval: 
+    # e.g., if conf.interval is .95, use .975 (above/below), and use df=N-1
+    ciMult <- qt(conf.interval/2 + .5, datac$N-1)
+    datac$ci <- datac$se * ciMult
+
+    return(datac)
+}
+##
+##
+normDataWithin <- function(data=NULL, idvar, measurevar, betweenvars=NULL,
+                           na.rm=FALSE, .drop=TRUE) {
+    library(plyr)
+
+    # Measure var on left, idvar + between vars on right of formula.
+    data.subjMean <- ddply(data, c(idvar, betweenvars), .drop=.drop,
+     .fun = function(xx, col, na.rm) {
+        c(subjMean = mean(xx[,col], na.rm=na.rm))
+      },
+      measurevar,
+      na.rm
+    )
+
+    # Put the subject means with original data
+    data <- merge(data, data.subjMean)
+
+    # Get the normalized data in a new column
+    measureNormedVar <- paste(measurevar, "_norm", sep="")
+    data[,measureNormedVar] <- data[,measurevar] - data[,"subjMean"] +
+                               mean(data[,measurevar], na.rm=na.rm)
+
+    # Remove this subject mean column
+    data$subjMean <- NULL
+
+    return(data)
+}
+##
+##
+summarySEwithin <- function(data=NULL, measurevar, betweenvars=NULL, withinvars=NULL,
+                            idvar=NULL, na.rm=FALSE, conf.interval=.95, .drop=TRUE) {
+
+  # Ensure that the betweenvars and withinvars are factors
+  factorvars <- vapply(data[, c(betweenvars, withinvars), drop=FALSE],
+    FUN=is.factor, FUN.VALUE=logical(1))
+
+  if (!all(factorvars)) {
+    nonfactorvars <- names(factorvars)[!factorvars]
+    message("Automatically converting the following non-factors to factors: ",
+            paste(nonfactorvars, collapse = ", "))
+    data[nonfactorvars] <- lapply(data[nonfactorvars], factor)
+  }
+
+  # Get the means from the un-normed data
+  datac <- summarySE(data, measurevar, groupvars=c(betweenvars, withinvars),
+                     na.rm=na.rm, conf.interval=conf.interval, .drop=.drop)
+
+  # Drop all the unused columns (these will be calculated with normed data)
+  datac$sd <- NULL
+  datac$se <- NULL
+  datac$ci <- NULL
+
+  # Norm each subject's data
+  ndata <- normDataWithin(data, idvar, measurevar, betweenvars, na.rm, .drop=.drop)
+
+  # This is the name of the new column
+  measurevar_n <- paste(measurevar, "_norm", sep="")
+
+  # Collapse the normed data - now we can treat between and within vars the same
+  ndatac <- summarySE(ndata, measurevar_n, groupvars=c(betweenvars, withinvars),
+                      na.rm=na.rm, conf.interval=conf.interval, .drop=.drop)
+
+  # Apply correction from Morey (2008) to the standard error and confidence interval
+  #  Get the product of the number of conditions of within-S variables
+  nWithinGroups    <- prod(vapply(ndatac[,withinvars, drop=FALSE], FUN=nlevels,
+                           FUN.VALUE=numeric(1)))
+  correctionFactor <- sqrt( nWithinGroups / (nWithinGroups-1) )
+
+  # Apply the correction factor
+  ndatac$sd <- ndatac$sd * correctionFactor
+  ndatac$se <- ndatac$se * correctionFactor
+  ndatac$ci <- ndatac$ci * correctionFactor
+
+  # Combine the un-normed means with the normed results
+  merge(datac, ndatac)
+}
+
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+## Importing and describing final datasets -----
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+```{r final datasets}
+EFrepSENseen <- EFrepSENfinal_OK
+names(EFrepSENseen)
+EFrepSENseen <- as.data.frame(EFrepSENseen)
+str(EFrepSENseen) # 759 obs. 291(?) individuals (Metal)
+EFrepSENseen[,c(2:4,7:12,14)] <- lapply(EFrepSENseen[,c(2:4,7:12,14)], factor)
+EFrepSENseen$yearF <- as.factor(EFrepSENseen$year)
+range(EFrepSENseen$age, na.rm=T) # 2 14
+  
 
-```{r cars}
-summary(cars)
+EFlrs <- EFlrs_final_OK
+names(EFlrs)
+str(EFlrs)   # 302 individuals
+EFlrs <- as.data.frame(EFlrs)
+EFlrs[,c(1,4,5)] <- lapply(EFlrs[,c(1,4,5)], factor)
+EFlrs$birthyearF <- as.factor(EFlrs$nacimiento)
+summary(EFlrs$birthyearF)
+#2007 2009 2010 2011 2012 2013 2015 2016 2017 2018 2019 2020 NA's 
+#   8   43   36   18    9   11   10   31   36   17   37    4   42 
+range(EFlrs$lifespan, na.rm=T) # 2 14
+median(EFlrs$lifespan, na.rm=T) # 6
+mean(EFlrs$lifespan, na.rm=T) # 6.320896
+sd(EFlrs$lifespan, na.rm=T) # 2.888958
+hist(EFlrs$lifespan) 
+#given distribution and median lifespan, censor data for ind born after 2019
+EFlrsCENS <-EFlrs %>% 
+  filter(nacimiento < 2016)%>% 
+   droplevels()
+summary(EFlrsCENS$birthyearF)
+#2007 2009 2010 2011 2012 2013 2015 2016 2017 2018 
+#   8   43   36   18    9   11   10   31   36   17 
+str(EFlrsCENS) # 135 individuals
+EFlrsCENSm <- subset(EFlrsCENS, SEX01==1)
+str(EFlrsCENSm)  # 72 males
+table(EFlrsCENSm$Morph)
+# pale dark
+# 55   17 
+EFlrsCENSf <- subset(EFlrsCENS, SEX01==0)
+str(EFlrsCENSf) # 63 females
+table(EFlrsCENSf$Morph)
+# pale dark
+#  55  8
 ```
 
-## Including Plots
+```{r descriptive stats on ages, followed years, etc.}
 
-You can also embed plots, for example:
+range(EFrepSENseenFcomplete$edad_dias, na.rm = T) #18.62  38.91
+mean(EFrepSENseenFcomplete$edad_dias, na.rm = T) #29.42483
+sd(EFrepSENseenFcomplete$edad_dias, na.rm = T) #4.667373
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+range(EFrepSENseenMcomplete$edad_dias, na.rm = T) #14.22 40.00
+mean(EFrepSENseenMcomplete$edad_dias, na.rm = T) #29.00436
+sd(EFrepSENseenMcomplete$edad_dias, na.rm = T) #5.567109
+
+EFrepSENseenComplete <- rbind(EFrepSENseenFcomplete, EFrepSENseenMcomplete)
+range(EFrepSENseenComplete$edad_dias, na.rm = T) #14.22 40.00
+mean(EFrepSENseenComplete$edad_dias, na.rm = T) #29.1908
+sd(EFrepSENseenComplete$edad_dias, na.rm = T) #5.187025
+
+
+
+
+range(EFrepSENseenFcomplete$age) #2 14
+mean(EFrepSENseenFcomplete$age) #5.535156
+sd(EFrepSENseenFcomplete$age) #2.661036
+EFrepSENseenFcompleteDARK <- subset(EFrepSENseenFcomplete, Morph=="N")
+range(EFrepSENseenFcompleteDARK$age) #2 13
+mean(EFrepSENseenFcompleteDARK$age) #5.37931
+sd(EFrepSENseenFcompleteDARK$age) #2.704676
+EFrepSENseenFcompletePALE <- subset(EFrepSENseenFcomplete, Morph=="B")
+range(EFrepSENseenFcompletePALE$age) #2 13
+mean(EFrepSENseenFcompletePALE$age) #5.555066
+sd(EFrepSENseenFcompletePALE$age) #2.660812
+
+
+
+range(EFrepSENseenMcomplete$age) #2 13
+mean(EFrepSENseenMcomplete$age) #5.831715
+sd(EFrepSENseenMcomplete$age) #2.571856
+EFrepSENseenMcompleteDARK <- subset(EFrepSENseenMcomplete, Morph=="N")
+range(EFrepSENseenMcompleteDARK$age) #2 10
+mean(EFrepSENseenMcompleteDARK$age) #5.530864
+sd(EFrepSENseenMcompleteDARK$age) #2.092166
+EFrepSENseenMcompletePALE <- subset(EFrepSENseenMcomplete, Morph=="B")
+range(EFrepSENseenMcompletePALE$age) #2 13
+mean(EFrepSENseenMcompletePALE$age) #5.938596
+sd(EFrepSENseenMcompletePALE$age) #2.71814
+
+# to get followed years
+names(EFrepSENseenFcomplete)
+follYf <- EFrepSENseenFcomplete[,c(2,6)]
+
+#TOTAL F
+n_occur <- data.frame(table(follYf$Metal))
+x <- n_occur[n_occur$Freq > 1,] ##note it doesnt count females for which there's only 1 occasion
+x <- as.data.frame(x)
+str(x)
+range(x$Freq) # 2  8
+mean(x$Freq) #3.328125
+sd(x$Freq) #1.543596
+str(x)
+x$Freq <- as.factor(x$Freq)
+table(x$Freq)
+## 103 females: sampling occasions summary table
+## sampling occasions  1   2    3   4 or more (up to 8)
+## freq               38   27  14   24
+
+## detail on more than 4 times
+# sampling occasions   4  5  6  7  8 
+# freq                10  6  5  2  1 
+
+
+#DARK & PALE F
+names(EFrepSENseenFcomplete)
+follYf <- EFrepSENseenFcomplete[,c(2,4,6,13)]
+follYfd <- subset(follYf, Morph=="N")
+follYfdcount <- follYfd[,c(1,2)]
+follYfdcount <- unique(follYfdcount)
+str(follYfdcount) # 10 dark females
+n_occur <- data.frame(table(follYfd$Metal))
+x <- n_occur[n_occur$Freq > 1,] ##note it doesnt count females for which there's only 1 occasion
+x <- as.data.frame(x)
+str(x)
+y <- n_occur[n_occur$Freq == 1,] ##note it doesnt count females for which there's only 1 occasion
+y <- as.data.frame(y)
+str(y)
+range(x$Freq) # 2  8
+mean(x$Freq) #4.166667
+sd(x$Freq) #2.316607
+str(x)
+x$Freq <- as.factor(x$Freq)
+table(x$Freq)
+## 10 dark females: sampling occasions summary table
+## sampling occasions  1   2    3   5   8
+## freq                4   2    1   2   1
+follYfd$ageF <- as.factor(follYfd$age)
+table(follYfd$ageF)
+# age  2  3  4  5  6  7  8  9 11 13 
+# N    2  6  6  4  3  2  2  2  1  1 
+
+
+follYfp <- subset(follYf, Morph=="B")
+follYfpcount <- follYfp[,c(1,2)]
+follYfpcount <- unique(follYfpcount)
+str(follYfpcount) # 93 pale females
+n_occur <- data.frame(table(follYfp$Metal))
+x <- n_occur[n_occur$Freq > 1,] ##note it doesnt count females for which there's only 1 occasion
+x <- as.data.frame(x)
+str(x)
+y <- n_occur[n_occur$Freq > 1,] ##note it doesnt count females for which there's only 1 occasion
+y <- as.data.frame(y)
+str(y)
+range(x$Freq) # 2  7
+mean(x$Freq) #3.254237
+sd(x$Freq) #1.433506
+x$Freq <- as.factor(x$Freq)
+table(x$Freq)
+## 93 pale females: sampling occasions summary table
+## sampling occasions   1   2    3   4   5   6   7
+## freq                59   25   13  10  5   4   2
+follYfp$ageF <- as.factor(follYfp$age)
+table(follYfp$ageF)
+#age   2  3  4  5  6  7  8  9 10 11 12 14 
+# N   20 36 41 31 31 19 12 15 10  4  6  2 
+
+
+
+
+
+names(EFrepSENseenMcomplete)
+follYm <- EFrepSENseenMcomplete[,c(2,6)]
+
+n_occur <- data.frame(table(follYm$Metal))
+x <- n_occur[n_occur$Freq > 1,]
+x <- as.data.frame(x)
+range(x$Freq) # 2  9
+mean(x$Freq) #3.195122
+sd(x$Freq) #1.636309
+str(x)
+x$Freq <- as.factor(x$Freq)
+table(x$Freq)
+## 123 males: sampling occasions summary table
+## sampling occasions  1  2    3   4 or more (up to 9)
+## freq               39 40  20   24
+
+## detail on more than 4 times
+# sampling occasions    4  5  6  7  9 
+# freq                  8  7  5  2  2
+
+
+#DARK & PALE M
+names(EFrepSENseenMcomplete)
+follYm <- EFrepSENseenMcomplete[,c(2,4,6,13)]
+follYmd <- subset(follYm, Morph=="N")
+follYmdcount <- follYmd[,c(1,2)]
+follYmdcount <- unique(follYmdcount)
+str(follYmdcount) # 26 dark males
+n_occur <- data.frame(table(follYmd$Metal))
+x <- n_occur[n_occur$Freq > 1,] ##note it doesnt count females for which there's only 1 occasion
+x <- as.data.frame(x)
+str(x)
+y <- n_occur[n_occur$Freq == 1,] ##note it doesnt count females for which there's only 1 occasion
+y <- as.data.frame(y)
+str(y)
+range(x$Freq) # 2  6
+mean(x$Freq) #3.5
+sd(x$Freq) #1.40577
+str(x)
+x$Freq <- as.factor(x$Freq)
+table(x$Freq)
+## 26 dark males: sampling occasions summary table
+## sampling occasions  1   2   3   4   5   6
+## freq                4   7   5   5   2   3
+follYmd$ageF <- as.factor(follYmd$age)
+table(follYmd$ageF)
+# age  2  3  4  5  6  7  8  9 10
+# N    4 11 14 13 14 10  6  6  3
+
+
+follYmp <- subset(follYm, Morph=="B")
+follYmp$ageF <- as.factor(follYmp$age)
+table(follYmp$ageF)
+#age   2  3  4  5  6  7  8  9 10 11 12 13
+# N    9 40 36 43 22 21 18 16 12  6  7  4 
+
+
+
+##importing df for CS and offs means
+dfCSoffs07_22 <- as.data.frame(dfCSoffs07_22)
+str(dfCSoffs07_22)
+dfCSoffs07_22 <- unique(dfCSoffs07_22)
+dfCSoffs07_22$nest <- as.factor(dfCSoffs07_22$nest)
+mean(dfCSoffs07_22$clutch_size, na.rm=T) #2.407947
+sd(dfCSoffs07_22$clutch_size, na.rm=T) #0.8307361
+
+mean(dfCSoffs07_22$fledglings, na.rm=T) #1.548466
+sd(dfCSoffs07_22$fledglings, na.rm=T) #0.9924999
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+### OFFSPRING NUMBER -----
+
+#GLMMTMB MODELS
+
+
+## males with productivity
+
+
+```{r model selection for fixed effects m}
+#using simple random eff structure
+#modelling response as successes/failures
+control.tmb <- glmmTMBControl(optCtrl=list(iter.max=7e3, eval.max=7e3), 
+                profile=T,parallel=10)
+
+m1 <- glmmTMB( cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*prodC*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenMcomplete, control=control.tmb, family=binomial(link="logit"))
+
+m2 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*prodC*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenMcomplete, control=control.tmb, family=binomial(link="logit"))
+
+m3 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM))~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*prodC+
+                     I(deltaAGE^2)*prodBIRTHC+
+                     prodC*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenMcomplete, control=control.tmb, family=binomial(link="logit"))
+
+m4 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*prodC+
+                     I(avgAGE^2)*prodBIRTHC+
+                    prodC*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), 
+              REML=T, data=EFrepSENseenMcomplete, control=control.tmb,
+              family=binomial(link="logit"))
+
+m5 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*prodC+
+                     I(avgAGE^2)*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), 
+              REML=T, data=EFrepSENseenMcomplete, control=control.tmb,
+              family=binomial(link="logit"))
+
+m6 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     layingST+deltaAGE+avgAGE+I(deltaAGE^2)*prodC+
+                     I(deltaAGE^2)*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=T, data=EFrepSENseenMcomplete, control=control.tmb, family=binomial(link="logit"))
+
+
+val_AICc <- MuMIn::AICc(m1, m2,m3,m4,m5,m6)
+val_AICc
+#   df     AICc
+#m1 17 795.2301
+#m2 17 790.2766
+#m3 16 786.3114
+#m4 16 787.7608
+#m5 15 787.4429
+#m6 15 786.1336
+
+Weights(na.omit(val_AICc)) # 0.004 0.042 0.304 0.147 0.172 0.332
+
+```
+
+```{r final model m}
+
+m.offs <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     layingST+deltaAGE+avgAGE+I(deltaAGE^2)*prodC+
+                     I(deltaAGE^2)*prodBIRTHC+
+                  #random effects
+                    (1|nacimiento)+(1|year)+(1|Metal)+(1|location_9sites), 
+                  data=EFrepSENseenMcomplete, control=control.tmb, family=binomial(link="logit"))
+
+```
+
+```{r model residuals m}
+
+res.devian <- residuals(m.offs, type="pearson")   
+##  DHARMa standardised resid 0-1
+res.dharma <- simulateResiduals(m.offs)$scaledResiduals
+plot(res.devian, res.dharma)
+plot(rank(res.devian), res.dharma)
+
+##  GLOBAL DIAGNOSIS 
+testUniformity(m.offs) #normality
+#DD = 0.048351, p-value = 0.4654
+testQuantiles(m.offs) #heteroscedasticity
+#p-value = 0.4864
+testOutliers(m.offs) 
+#no outliers
+testZeroInflation(m.offs)
+#no inflation: ratioObsSim = 0.90452, p-value = 0.624
+
+##   plots all at once
+plot(simulateResiduals(m.offs))
+
+##   only for Poisson or binomial; has to be close to 1
+testDispersion(m.offs) #dispersion = 0.92831, p-value = 0.264
+##  there is no dispersion but if there were, it can be corrected with argument dispformula
+
+
+```
+
+```{r model results m}
+summary(m.offs)$coefficients
+
+round(confint(m.offs, level=0.95, method="Wald"), 3)
+##  transform to get response coeff
+round(exp(confint(m.offs, level=0.95, method="Wald")), 3)  
+
+## BOOTSTRAP 
+set.seed(111)
+model.bootstrap <- bootstrap_parameters(m.offs, ci=0.95, iterations=100, centrality="median", test=c("p_direction", "p_map", "p-value"), ci_method=c("BCI"))
+model.bootstrap
+# does not work, some runs fail to converge
+
+
+# random effects
+summary(m.offs)$varcor
+summary(m.offs)$sigma    ## sd for residual error
+summary(update(m.offs, REML=TRUE))$varcor
+summary(update(m.offs, REML=TRUE))$sigma
+
+r.squaredGLMM(update(m.offs, REML=TRUE))    
+r2_nakagawa(update(m.offs, REML=TRUE))
+
+
+sjPlot::tab_model(m.offs,
+        show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/offspringM.doc")
+```
+
+
+## males with winds
+
+
+
+```{r model selection for fixed effects m w}
+#using simple random eff structure
+#modelling response as successes/failures
+m1 <- glmmTMB( cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*windC*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenMcomplete2, control=control.tmb, family=binomial(link="logit"))
+
+m2 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*windC*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenMcomplete2, control=control.tmb, family=binomial(link="logit"))
+
+m3 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM))~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*windBIRTHC+
+                     windC*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenMcomplete2, control=control.tmb, family=binomial(link="logit"))
+
+m4 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*windC+
+                     I(avgAGE^2)*windBIRTHC+
+                    windC*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), 
+              REML=T, data=EFrepSENseenMcomplete2, control=control.tmb,
+              family=binomial(link="logit"))
+
+m5 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*windC+
+                     I(avgAGE^2)*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), 
+              REML=T, data=EFrepSENseenMcomplete2, control=control.tmb,
+              family=binomial(link="logit"))
+
+m6 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     layingST+deltaAGE+avgAGE+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=T, data=EFrepSENseenMcomplete2, control=control.tmb, family=binomial(link="logit"))
+
+
+val_AICc <- MuMIn::AICc(m1, m2,m3,m4,m5,m6)
+val_AICc
+#   df     AICc
+#m1 17 827.7666
+#m2 17 815.9456
+#m3 16 808.8753
+#m4 16 817.0074
+#m5 15 816.7001
+#m6 15 809.8126
+
+Weights(na.omit(val_AICc)) # 0.000 0.017 0.591 0.010 0.012 0.370
+
+```
+
+```{r final model m w}
+
+
+m.offs.w <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM))~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*windBIRTHC+
+                     windC*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), 
+                  data=EFrepSENseenMcomplete2, control=control.tmb, 
+                  family=binomial(link="logit"))
+
+# marginal effects from ggeffects package (marginaleffects or margins don't work); also ggemmeans() or ggeffect() from this packaged don't work, gives either 'undefined columns selected' or 'variable lengths differ (found for 'F')' error
+
+dat <- ggpredict(m.offs.w, term = c("deltaAGE"), bias_correction = T)
+dat
+#deltaAGE | Predicted |     95% CI
+#---------------------------------
+#      -6 |      0.46 | 0.15, 0.65
+#      -5 |      0.48 | 0.27, 0.58
+#      -3 |      0.49 | 0.45, 0.52
+#      -2 |      0.50 | 0.48, 0.52
+#      -1 |      0.50 | 0.49, 0.52
+#       1 |      0.51 | 0.49, 0.53
+#       2 |      0.51 | 0.49, 0.54
+#       5 |      0.52 | 0.39, 0.71
+#
+#Adjusted for:
+#*           Morph =     B
+#*          avgAGE =  6.02
+#*        layingST = -0.02
+#*           windC = -0.03
+#*      windBIRTHC =  0.08
+#*      nacimiento = NA (population-level)
+#*            year = NA (population-level)
+#*           Metal = NA (population-level)
+#* location_9sites = NA (population-level)
+
+dat2 <- ggpredict(m.offs.w, term = c("deltaAGE [all]", "windBIRTHC"),  n=Inf)
+dat2
+#Error in predict.glmmTMB(list(obj = list(par = c(beta = -1.39574800671982,  :  argument 7 matches multiple formal arguments
+
+dat3 <- ggpredict(m.offs.w, term = "windC", n=Inf)
+dat3
+#Error in predict.glmmTMB(list(obj = list(par = c(beta = -1.39574800671982,  :  argument 7 matches multiple formal arguments
+```
+
+
+```{r bootstrap males w}
+
+m.offs.wGLMER <- glmer(cbind(OffspringNUM, (3-OffspringNUM))~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*windBIRTHC+
+                     windC*windBIRTHC+
+                  #random effects
+                    (1|nacimiento)+(1|year)+(1|Metal)+(1|location_9sites), 
+                    data=EFrepSENseenMcomplete2,
+                    family=binomial(link="logit"), nAGQ=1, 
+                    glmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                 optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)))
+
+#run takes ~50min
+mcmc.fixed <- bootMer(m.offs.wGLMER, FUN=fixef, nsim=1000, type="parametric", seed=1)
+coef.mcmc.fixed <- as.data.frame(mcmc.fixed$t)
+table_mc <- describe(coef.mcmc.fixed)[,c(1:4,11:12)]
+colnames(table_mc)[4] <- "SE"
+table_mc$Zeta <- table_mc$mean / table_mc$SE
+table_mc$p_boot <- round(2*pnorm(abs(table_mc$Zeta), lower.tail=FALSE), 5)
+table_mc$coef.model <- round(fixef(m.offs.wGLMER), 5)
+print(table_mc, digits=5)
+
+#                         vars    n     mean      SE     skew kurtosis     Zeta  p_boot     coef.model
+#(Intercept)                 1 1000 -1.37147 0.25969  0.34322  5.44624 -5.28113 0.00000       -1.40573
+#I(deltaAGE^2)               2 1000 -0.02927 0.03409  0.03281  0.05218 -0.85866 0.39053       -0.03004
+#MorphN                      3 1000 -0.15544 0.25128  0.21846  1.05542 -0.61858 0.53619       -0.21094
+#I(avgAGE^2)                 4 1000 -0.02388 0.00950 -0.01261  1.05993 -2.51276 0.01198*      -0.02475
+#deltaAGE                    5 1000  0.09144 0.05214 -0.00492 -0.10447  1.75358 0.07950.       0.08783
+#avgAGE                      6 1000  0.39106 0.10570 -0.10548  1.87399  3.69968 0.00022***     0.40190
+#layingST                    7 1000 -0.08907 0.07543  0.10467  0.05770 -1.18084 0.23767       -0.09053
+#windC                       8 1000 -0.57272 0.11132 -0.05808 -0.00971 -5.14489 0.00000***    -0.56858
+#windBIRTHC                  9 1000 -0.06937 0.10692  0.13878 -0.11209 -0.64879 0.51647       -0.06884
+#I(deltaAGE^2):MorphN       10 1000  0.05493 0.06743  0.02693  0.63623  0.81465 0.41527        0.05271
+#MorphN:I(avgAGE^2)         11 1000 -0.00333 0.00836  0.10410  0.10079 -0.39788 0.69072       -0.00191
+#I(deltaAGE^2):windC        12 1000  0.00518 0.01832 -0.35851  0.34502  0.28267 0.77743        0.00792
+#I(deltaAGE^2):windBIRTHC   13 1000  0.08476 0.04977  0.00461 -0.18905  1.70305 0.08856.      0.08076
+#windC:windBIRTHC           14 1000  0.15135 0.07844 -0.00181  0.15948  1.92946 0.05367.       0.14680
+
+
+# graphs in main ms: avgAGE^2; windC
+
+datz <- ggpredict(m.offs.wGLMER, term = c("avgAGE [all]"))
+print(datz, n=Inf)
+malesMARGeffsAVGage <- as.data.frame(datz)
+write.csv(malesMARGeffsAVGage, "malesMARGeffsAVGage.csv", row.names = F)
+#avgAGE | Predicted |     95% CI
+#-------------------------------
+#  2.00 |      0.33 | 0.19, 0.52
+#  3.50 |      0.42 | 0.32, 0.54
+#  4.60 |      0.48 | 0.38, 0.58
+#  5.33 |      0.51 | 0.41, 0.60
+#  6.00 |      0.53 | 0.43, 0.63
+#  7.25 |      0.55 | 0.45, 0.65
+#  7.67 |      0.55 | 0.45, 0.66
+# 11.67 |      0.48 | 0.25, 0.72
+#
+#Adjusted for:
+#*        deltaAGE = -0.19
+#*           Morph =     B
+#*        layingST = -0.02
+#*           windC = -0.03
+#*      windBIRTHC =  0.08
+#*      nacimiento = 0 (population-level)
+#*            year = 0 (population-level)
+#*           Metal = 0 (population-level)
+#* location_9sites = 0 (population-level)
+
+datxx <- ggpredict(m.offs.wGLMER, term = c("windC [all]"))
+print(datxx, n=Inf)
+malesMARGeffsWIND <- as.data.frame(datxx)
+write.csv(malesMARGeffsWIND, "malesMARGeffsWIND.csv", row.names = F)
+#windC | Predicted |     95% CI
+#------------------------------
+#-2.38 |      0.81 | 0.69, 0.89
+#-2.10 |      0.78 | 0.66, 0.86
+#-1.00 |      0.66 | 0.55, 0.75
+#-0.70 |      0.62 | 0.52, 0.71
+#-0.22 |      0.55 | 0.45, 0.65
+# 0.78 |      0.42 | 0.31, 0.53
+# 1.10 |      0.37 | 0.27, 0.49
+# 3.58 |      0.13 | 0.06, 0.26
+#
+#Adjusted for:
+#*        deltaAGE = -0.19
+#*           Morph =     B
+#*          avgAGE =  6.02
+#*        layingST = -0.02
+#*      windBIRTHC =  0.08
+#*      nacimiento = 0 (population-level)
+#*            year = 0 (population-level)
+#*           Metal = 0 (population-level)
+#* location_9sites = 0 (population-level)
+
+
+
+
+# for other graphs in suppl : avgAGE^2; windC
+
+daty <- ggpredict(m.offs.wGLMER, term = c("deltaAGE [all]", "windBIRTHC"))
+daty
+write.csv(daty, "malesMARGeffsDELTAageWINDbirth.csv", row.names = F)
+#windBIRTHC: -0.95
+#
+#deltaAGE | Predicted |     95% CI
+#---------------------------------
+#   -6.00 |      0.02 | 0.00, 0.65
+#   -3.00 |      0.26 | 0.10, 0.53
+#   -1.50 |      0.46 | 0.35, 0.57
+#   -0.14 |      0.55 | 0.43, 0.66
+#    1.14 |      0.54 | 0.43, 0.65
+#    5.00 |      0.12 | 0.00, 0.79
+#
+#windBIRTHC: 0.08
+#
+#deltaAGE | Predicted |     95% CI
+#---------------------------------
+#   -6.00 |      0.22 | 0.03, 0.70
+#   -3.00 |      0.41 | 0.27, 0.57
+#   -1.50 |      0.49 | 0.39, 0.59
+#   -0.14 |      0.53 | 0.43, 0.63
+#    1.14 |      0.55 | 0.45, 0.65
+#    5.00 |      0.49 | 0.17, 0.82
+#
+#windBIRTHC: 1.1
+#
+#deltaAGE | Predicted |     95% CI
+#---------------------------------
+#   -6.00 |      0.84 | 0.28, 0.99
+#   -3.00 |      0.58 | 0.40, 0.74
+#   -1.50 |      0.51 | 0.40, 0.62
+#   -0.14 |      0.51 | 0.40, 0.62
+#    1.14 |      0.56 | 0.45, 0.66
+#    5.00 |      0.88 | 0.54, 0.98
+#
+#Adjusted for:
+#*           Morph =     B
+#*          avgAGE =  6.02
+#*        layingST = -0.02
+#*           windC = -0.03
+#*      nacimiento = 0 (population-level)
+#*            year = 0 (population-level)
+#*           Metal = 0 (population-level)
+#* location_9sites = 0 (population-level)
+
+#not needed bc quadratic term is included in interaction
+dat <- ggpredict(m.offs.wGLMER, term = c("deltaAGE [all]"))
+dat
+#deltaAGE | Predicted |     95% CI
+#---------------------------------
+#   -6.00 |      0.22 | 0.03, 0.70
+#   -3.60 |      0.38 | 0.21, 0.58
+#   -2.25 |      0.45 | 0.34, 0.57
+#   -1.14 |      0.50 | 0.40, 0.60
+#   -0.14 |      0.53 | 0.43, 0.63
+#    0.86 |      0.55 | 0.45, 0.64
+#    1.75 |      0.55 | 0.44, 0.66
+#    5.00 |      0.49 | 0.17, 0.82
+#
+#
+#Adjusted for:
+#*           Morph =     B
+#*          avgAGE =  6.02
+#*        layingST = -0.02
+#*           windC = -0.03
+#*      windBIRTHC =  0.08
+#*      nacimiento = NA (population-level)
+#*            year = NA (population-level)
+#*           Metal = NA (population-level)
+#* location_9sites = NA (population-level)
+
+```
+
+
+```{r model residuals m w}
+
+res.devian <- residuals(m.offs.w, type="pearson")   
+##  DHARMa standardised resid 0-1
+res.dharma <- simulateResiduals(m.offs.w)$scaledResiduals
+plot(res.devian, res.dharma)
+plot(rank(res.devian), res.dharma)
+
+##  GLOBAL DIAGNOSIS 
+testUniformity(m.offs.w) #normality
+#D = 0.056021, p-value = 0.2867
+testQuantiles(m.offs.w) #heteroscedasticity
+#p-value = 0.2176
+testOutliers(m.offs.w) 
+#no outliers
+testZeroInflation(m.offs.w)
+#no inflation: ratioObsSim = 0.85573, p-value = 0.528
+
+##   plots all at once
+plot(simulateResiduals(m.offs.w))
+
+##   only for Poisson or binomial; has to be close to 1
+testDispersion(m.offs.w) #dispersion = 0.91478, p-value = 0.216
+##  there is no dispersion but if there were, it can be corrected with argument dispformula
+
+
+```
+
+```{r model results m w}
+summary(m.offs.w)$coefficients
+
+round(confint(m.offs.w, level=0.95, method="Wald"), 3)
+##  transform to get response coeff
+round(exp(confint(m.offs.w, level=0.95, method="Wald")), 3)  
+
+## BOOTSTRAP 
+set.seed(111)
+model.bootstrap <- bootstrap_parameters(m.offs.w, ci=0.95, iterations=100, centrality="median", test=c("p_direction", "p_map", "p-value"), ci_method=c("BCI"))
+model.bootstrap
+# does not work, some runs fail to converge
+
+
+# random effects
+summary(m.offs.w)$varcor
+summary(m.offs.w)$sigma    ## sd for residual error
+summary(update(m.offs.w, REML=TRUE))$varcor
+summary(update(m.offs.w, REML=TRUE))$sigma
+
+r.squaredGLMM(update(m.offs.w, REML=TRUE))    
+r2_nakagawa(update(m.offs.w, REML=TRUE))
+
+
+sjPlot::tab_model(m.offs.w,
+        show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/offspringMw.doc")
+```
+
+
+
+
+## females with productivity
+
+
+```{r model selection for fixed effects f}
+#using simple random eff structure
+#modelling response as successes/failures
+m1 <- glmmTMB( cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*prodC*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenFcomplete, control=control.tmb, family=binomial(link="logit"))
+
+m2 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*prodC*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenFcomplete, control=control.tmb, family=binomial(link="logit"))
+
+m3 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM))~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*prodC+
+                     I(deltaAGE^2)*prodBIRTHC+
+                     prodC*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenFcomplete, control=control.tmb, family=binomial(link="logit"))
+
+m4 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*prodC+
+                     I(avgAGE^2)*prodBIRTHC+
+                    prodC*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), 
+              REML=T, data=EFrepSENseenFcomplete, control=control.tmb,
+              family=binomial(link="logit"))
+
+m5 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*prodC+
+                     I(avgAGE^2)*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), 
+              REML=T, data=EFrepSENseenFcomplete, control=control.tmb,
+              family=binomial(link="logit"))
+
+m6 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     layingST+deltaAGE+avgAGE+I(deltaAGE^2)*prodC+
+                     I(deltaAGE^2)*prodBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=T, data=EFrepSENseenFcomplete, control=control.tmb, family=binomial(link="logit"))
+
+
+val_AICc <- MuMIn::AICc(m1, m2,m3,m4,m5,m6)
+val_AICc
+#   df     AICc
+#m1 17 662.7111
+#m2 17 659.4281
+#m3 16 655.5669
+#m4 16 657.3828
+#m5 15 656.9647
+#m6 15 655.4331
+
+Weights(na.omit(val_AICc)) # 0.009 0.046 0.318 0.128 0.158 0.340
+
+```
+
+```{r final model f}
+
+fem.offs <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     layingST+deltaAGE+avgAGE+I(deltaAGE^2)*prodC+
+                     I(deltaAGE^2)*prodBIRTHC+
+                  #random effects
+                     (1|nacimiento)+(1|year)+(1|Metal)+(1|location_9sites), 
+                  data=EFrepSENseenFcomplete, control=control.tmb, family=binomial(link="logit"))
+
+# Warning in finalizeTMB(TMBStruc, obj, fit, h, data.tmb.old) : Model convergence problem; non-positive-definite Hessian matrix. See vignette('troubleshooting')
+# warning resolves when removing individual ID from random
+```
+
+
+
+```{r model residuals f}
+
+res.devian <- residuals(fem.offs, type="pearson")   
+##  DHARMa standardised resid 0-1
+res.dharma <- simulateResiduals(fem.offs)$scaledResiduals
+plot(res.devian, res.dharma)
+plot(rank(res.devian), res.dharma)
+
+##  GLOBAL DIAGNOSIS 
+testUniformity(fem.offs) #normality
+#D=0.050399, p-value = 0.5338
+testQuantiles(fem.offs) #heteroscedasticity
+#p-value = 0.9974
+testOutliers(fem.offs) 
+#no outliers
+testZeroInflation(fem.offs)
+#no inflation: ratioObsSim = 1.0264, p-value = 0.904
+
+##   plots all at once
+plot(simulateResiduals(fem.offs))
+
+##   only for Poisson or binomial; has to be close to 1
+testDispersion(fem.offs) #dispersion = 0.90417, p-value = 0.088
+##  there is no dispersion but if there were, it can be corrected with argument dispformula
+
+
+```
+
+```{r model results f}
+summary(fem.offs)$coefficients
+
+round(confint(fem.offs, level=0.95, method="Wald"), 3)
+##  transform to get response coeff
+round(exp(confint(fem.offs, level=0.95, method="Wald")), 3)  
+
+## BOOTSTRAP 
+set.seed(111)
+model.bootstrap <- bootstrap_parameters(fem.offs, ci=0.95, iterations=100, centrality="median", test=c("p_direction", "p_map", "p-value"), ci_method=c("BCI"))
+model.bootstrap
+# does not work, some runs fail to converge
+
+
+# random effects
+summary(fem.offs)$varcor
+summary(fem.offs)$sigma    ## sd for residual error
+summary(update(fem.offs, REML=TRUE))$varcor
+summary(update(fem.offs, REML=TRUE))$sigma
+
+r.squaredGLMM(update(fem.offs, REML=TRUE))    
+r2_nakagawa(update(fem.offs, REML=TRUE))
+
+
+sjPlot::tab_model(fem.offs,
+        show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/offspringF.doc")
+```
+
+
+## females with winds
+
+
+
+```{r model selection for fixed effects f w}
+#using simple random eff structure
+#modelling response as successes/failures
+m1 <- glmmTMB( cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*windC*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenFcomplete2, control=control.tmb, family=binomial(link="logit"))
+
+m2 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*windC*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenFcomplete2, control=control.tmb, family=binomial(link="logit"))
+
+m3 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM))~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*windBIRTHC+
+                     windC*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=TRUE, data=EFrepSENseenFcomplete2, control=control.tmb, family=binomial(link="logit"))
+
+m4 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*windC+
+                     I(avgAGE^2)*windBIRTHC+
+                    windC*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), 
+              REML=T, data=EFrepSENseenFcomplete2, control=control.tmb,
+              family=binomial(link="logit"))
+
+m5 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(avgAGE^2)*windC+
+                     I(avgAGE^2)*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), 
+              REML=T, data=EFrepSENseenFcomplete2, control=control.tmb,
+              family=binomial(link="logit"))
+
+m6 <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     layingST+deltaAGE+avgAGE+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*windBIRTHC+
+                  #random effects
+                    (1|Metal)+(1|location_9sites), REML=T, data=EFrepSENseenFcomplete2, control=control.tmb, family=binomial(link="logit"))
+
+
+val_AICc <- MuMIn::AICc(m1, m2,m3,m4,m5,m6)
+val_AICc
+#   df     AICc
+#m1 17 702.8312
+#m2 17 694.2235
+#m3 16 686.1855
+#m4 16 691.0770
+#m5 15 685.5380
+#m6 15 680.6448
+
+Weights(na.omit(val_AICc)) # 0.000 0.001 0.054 0.005 0.075 0.865
+
+```
+
+```{r final model f w}
+
+fem.offs.w <- glmmTMB(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     layingST+deltaAGE+avgAGE+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*windBIRTHC+
+                  #random effects
+                    (1|nacimiento)+(1|year)+(1|Metal)+(1|location_9sites), 
+                  data=EFrepSENseenFcomplete2, control=control.tmb, family=binomial(link="logit"))
+
+# marginal effects from ggeffects package (marginaleffects or margins don't work); also ggemmeans() or ggeffect() from this packaged don't work, gives either 'undefined columns selected' or 'variable lengths differ (found for 'F')' error
+
+dat <- ggpredict(fem.offs.w, term = c("Morph [all]","deltaAGE"), bias_correction = T)
+dat
+# # Predicted probabilities of OffspringNUM
+
+#deltaAGE: -1.84
+#
+#Morph | Predicted |     95% CI
+#------------------------------
+#B     |      0.51 | 0.49, 0.53
+#N     |      0.53 | 0.49, 0.59
+#
+#deltaAGE: -0.21
+#
+#Morph | Predicted |     95% CI
+#------------------------------
+#B     |      0.51 | 0.49, 0.53
+#N     |      0.58 | 0.51, 0.71
+#
+#deltaAGE: 1.42
+#
+#Morph | Predicted |     95% CI
+#------------------------------
+#B     |      0.51 | 0.49, 0.54
+#N     |      0.55 | 0.50, 0.64
+#
+#Adjusted for:
+#*          avgAGE =  5.74
+#*        layingST = -0.08
+#*           windC = -0.12
+#*      windBIRTHC =  0.09
+#*      nacimiento = NA (population-level)
+#*            year = NA (population-level)
+#*           Metal = NA (population-level)
+#* location_9sites = NA (population-level)
+
+
+
+dat2 <- ggpredict(fem.offs.w, term = c("Morph [all]","avgAGE"), bias_correction = T)
+dat2
+#avgAGE: 3.61
+#
+#Morph | Predicted |     95% CI
+#------------------------------
+#B     |      0.49 | 0.46, 0.51
+#N     |      0.50 | 0.44, 0.54
+#
+#avgAGE: 5.74
+#
+#Morph | Predicted |     95% CI
+#------------------------------
+#B     |      0.51 | 0.49, 0.53
+#N     |      0.58 | 0.51, 0.71
+#
+#avgAGE: 7.88
+#
+#Morph | Predicted |     95% CI
+#------------------------------
+#B     |      0.52 | 0.50, 0.55
+#N     |      0.75 | 0.54, 0.92
+#
+#Adjusted for:
+#*        deltaAGE = -0.21
+#*        layingST = -0.08
+#*           windC = -0.12
+#*      windBIRTHC =  0.09
+#*      nacimiento = NA (population-level)
+#*            year = NA (population-level)
+#*           Metal = NA (population-level)
+#* location_9sites = NA (population-level)
+
+
+dat3 <- ggpredict(fem.offs.w, term = "layingST", bias_correction = T)
+dat3
+# Predicted probabilities of OffspringNUM
+#
+#layingST | Predicted |     95% CI
+#---------------------------------
+#   -2.20 |      0.54 | 0.51, 0.61
+#   -1.60 |      0.53 | 0.50, 0.58
+#   -1.00 |      0.52 | 0.50, 0.56
+#   -0.40 |      0.51 | 0.50, 0.54
+#    0.00 |      0.51 | 0.49, 0.53
+#    0.60 |      0.50 | 0.48, 0.52
+#    1.20 |      0.50 | 0.47, 0.52
+#    2.40 |      0.48 | 0.42, 0.51
+#
+#Adjusted for:
+#*        deltaAGE = -0.21
+#*           Morph =     B
+#*          avgAGE =  5.74
+#*           windC = -0.12
+#*      windBIRTHC =  0.09
+#*      nacimiento = NA (population-level)
+#*            year = NA (population-level)
+#*           Metal = NA (population-level)
+#* location_9sites = NA (population-level)
+#
+
+dat4 <- ggpredict(fem.offs.w, term = "windC", bias_correction = T)
+dat4
+#windC | Predicted |     95% CI
+#------------------------------
+#-2.44 |      0.62 | 0.54, 0.73
+#-2.16 |      0.60 | 0.53, 0.70
+#-1.06 |      0.54 | 0.51, 0.59
+#-0.45 |      0.52 | 0.50, 0.55
+#-0.28 |      0.51 | 0.50, 0.54
+# 0.41 |      0.50 | 0.48, 0.52
+# 1.04 |      0.48 | 0.45, 0.50
+# 3.52 |      0.35 | 0.20, 0.47
+#
+#Adjusted for:
+#*        deltaAGE = -0.21
+#*           Morph =     B
+#*          avgAGE =  5.74
+#*        layingST = -0.08
+#*      windBIRTHC =  0.09
+#*      nacimiento = NA (population-level)
+#*            year = NA (population-level)
+#*           Metal = NA (population-level)
+#* location_9sites = NA (population-level)
+```
+
+
+```{r bootstrap females w}
+
+fem.offs.wGLMER <- glmer(cbind(OffspringNUM, (3-OffspringNUM)) ~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     layingST+deltaAGE+avgAGE+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*windBIRTHC+
+                  #random effects
+                    (1|nacimiento)+(1|year)+(1|Metal)+(1|location_9sites), 
+                  data=EFrepSENseenFcomplete2, 
+                    family=binomial(link="logit"), nAGQ=1, 
+                    glmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                 optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)))
+
+#run takes ~50min
+mcmc.fixed <- bootMer(fem.offs.wGLMER, FUN=fixef, nsim=1000, type="parametric", seed=1)
+coef.mcmc.fixed <- as.data.frame(mcmc.fixed$t)
+table_mc <- describe(coef.mcmc.fixed)[,c(1:4,11:12)]
+colnames(table_mc)[4] <- "SE"
+table_mc$Zeta <- table_mc$mean / table_mc$SE
+table_mc$p_boot <- round(2*pnorm(abs(table_mc$Zeta), lower.tail=FALSE), 5)
+table_mc$coef.model <- round(fixef(fem.offs.wGLMER), 5)
+print(table_mc, digits=5)
+
+#                         vars    n     mean      SE     skew kurtosis     Zeta  p_boot     coef.model
+#(Intercept)                 1 1000 -1.61095 0.30445  0.39625  3.24008 -5.29135 0.00000       -1.67304
+#I(deltaAGE^2)               2 1000  0.01738 0.02835  0.17438  0.33701  0.61307 0.53983       0.01329
+#MorphN                      3 1000 -0.23720 0.32717 -0.25235  1.67557 -0.72500 0.46845       -0.25524
+#I(avgAGE^2)                 4 1000 -0.03061 0.01061  0.12459  0.64545 -2.88533 0.00391**     -0.03222
+#layingST                    5 1000 -0.21958 0.09273 -0.07759 -0.07485 -2.36800 0.01788*      -0.22489
+#deltaAGE                    6 1000  0.01110 0.05792  0.08499  0.17887  0.19167 0.84800       0.01311
+#avgAGE                      7 1000  0.47578 0.11919 -0.12124  1.49135  3.99181 0.00007***    0.49707
+#windC                       8 1000 -0.45961 0.11936 -0.23408  0.01033 -3.85053 0.00012***   -0.45207
+#windBIRTHC                  9 1000  0.01876 0.10167  0.03814 -0.12064  0.18451 0.85361       0.01532
+#I(deltaAGE^2):MorphN       10 1000 -0.18267 0.09055 -0.58017  1.10973 -2.01736 0.04366*      -0.15822
+#MorphN:I(avgAGE^2)         11 1000  0.03533 0.01547  1.11007  2.86055  2.28416 0.02236*    0.03187
+#I(deltaAGE^2):windC        12 1000  0.00368 0.02011  0.03284 -0.00750  0.18289 0.85489    0.00519
+#I(deltaAGE^2):windBIRTHC   13 1000 -0.02155 0.02762 -0.16694  0.27653 -0.78051 0.43509   -0.01892
+
+
+#marginal effects for graphs or tables for data
+# graphs in main ms: 
+
+datz <- ggpredict(fem.offs.wGLMER, term = c("avgAGE [all]", "Morph"))
+print(datz, n=10)
+femMARGeffsAVGageMORPH <- as.data.frame(datz)
+write.csv(femMARGeffsAVGageMORPH, "femMARGeffsAVGageMORPH.csv", row.names = F)
+#Morph: B
+#
+#avgAGE | Predicted |     95% CI
+#-------------------------------
+#  2.00 |      0.32 | 0.21, 0.47
+#  3.33 |      0.42 | 0.33, 0.52
+#  4.00 |      0.47 | 0.38, 0.55
+#  4.60 |      0.50 | 0.42, 0.58
+#  5.00 |      0.52 | 0.43, 0.60
+#  6.00 |      0.55 | 0.46, 0.64
+#  7.33 |      0.58 | 0.48, 0.67
+#  8.00 |      0.58 | 0.47, 0.67
+#  8.38 |      0.57 | 0.47, 0.67
+# 13.00 |      0.36 | 0.12, 0.70
+#
+#Morph: N
+#
+#avgAGE | Predicted |     95% CI
+#-------------------------------
+#  2.00 |      0.29 | 0.13, 0.53
+#  3.33 |      0.45 | 0.27, 0.64
+#  4.00 |      0.53 | 0.35, 0.70
+#  4.60 |      0.60 | 0.43, 0.75
+#  5.00 |      0.65 | 0.48, 0.79
+#  6.00 |      0.75 | 0.57, 0.87
+#  7.33 |      0.85 | 0.65, 0.95
+#  8.00 |      0.89 | 0.67, 0.97
+#  8.38 |      0.91 | 0.67, 0.98
+# 13.00 |      0.99 | 0.52, 1.00
+#
+#Adjusted for:
+#*        deltaAGE = -0.21
+#*        layingST = -0.08
+#*           windC = -0.12
+#*      windBIRTHC =  0.09
+#*      nacimiento = 0 (population-level)
+#*            year = 0 (population-level)
+#*           Metal = 0 (population-level)
+#* location_9sites = 0 (population-level)
+
+
+daty <- ggpredict(fem.offs.wGLMER, term = c("deltaAGE [all]", "Morph"))
+print(daty, n=10)
+femMARGeffsDELTAageMORPH <- as.data.frame(daty)
+write.csv(femMARGeffsDELTAageMORPH, "femMARGeffsDELTAageMORPH.csv", row.names = F)
+#Morph: B
+#
+#deltaAGE | Predicted |     95% CI
+#---------------------------------
+#   -5.62 |      0.61 | 0.27, 0.87
+#   -3.17 |      0.56 | 0.43, 0.69
+#   -2.38 |      0.56 | 0.45, 0.65
+#   -1.62 |      0.55 | 0.46, 0.64
+#   -1.00 |      0.55 | 0.46, 0.63
+#   -0.33 |      0.55 | 0.46, 0.63
+#    0.38 |      0.55 | 0.46, 0.64
+#    1.20 |      0.56 | 0.46, 0.65
+#    2.20 |      0.57 | 0.45, 0.68
+#    5.00 |      0.63 | 0.28, 0.88
+#
+#Morph: N
+#
+#deltaAGE | Predicted |     95% CI
+#---------------------------------
+#   -5.62 |      0.02 | 0.00, 0.67
+#   -3.17 |      0.37 | 0.15, 0.67
+#   -2.38 |      0.53 | 0.36, 0.70
+#   -1.62 |      0.64 | 0.49, 0.77
+#   -1.00 |      0.70 | 0.53, 0.82
+#   -0.33 |      0.72 | 0.55, 0.85
+#    0.38 |      0.73 | 0.55, 0.85
+#    1.20 |      0.69 | 0.53, 0.81
+#    2.20 |      0.58 | 0.39, 0.74
+#    5.00 |      0.07 | 0.00, 0.73
+#
+#Adjusted for:
+#*          avgAGE =  5.74
+#*        layingST = -0.08
+#*           windC = -0.12
+#*      windBIRTHC =  0.09
+#*      nacimiento = 0 (population-level)
+#*            year = 0 (population-level)
+#*           Metal = 0 (population-level)
+#* location_9sites = 0 (population-level)
+
+#extracting aprox peak age of dark fem breeding
+#get mean age for dark morph peak of rep 
+#makes sense to do mean even if some are really high or low values bc it will compensate w sample size
+#given marg effs I chose the delta age range that maximises marg effs which is 73%
+x <- subset(EFrepSENseenFcomplete2, deltaAGE>(-0.26))
+x2<- subset(x, Morph=="N")
+x3 <- subset(x2, deltaAGE<0.39)
+str(x3) #4 obs
+summary(x3$age) #mean 7.25 
+sd(x3$age) # 4.272002
+#given marg effs I chose the delta age range that includes 72 and 73% to get bigger N
+x <- subset(EFrepSENseenFcomplete2, deltaAGE>(-0.63))
+x2<- subset(x, Morph=="N")
+x3 <- subset(x2, deltaAGE<0.68)
+str(x3) #11 obs
+summary(x3$age) #mean 5.364  
+sd(x3$age) # 2.90767
+hist(x3$age)
+
+
+datb <- ggpredict(fem.offs.wGLMER, term = c("layingST"))
+print(datb, n=10)
+femMARGeffsLAYING <- as.data.frame(datb)
+write.csv(femMARGeffsLAYING, "femMARGeffsLAYING.csv", row.names = F)
+#layingST | Predicted |     95% CI
+#---------------------------------
+#   -2.20 |      0.66 | 0.53, 0.77
+#   -1.80 |      0.64 | 0.52, 0.74
+#   -1.20 |      0.61 | 0.50, 0.70
+#   -0.80 |      0.59 | 0.49, 0.68
+#   -0.40 |      0.57 | 0.47, 0.65
+#    0.00 |      0.54 | 0.45, 0.63
+#    0.60 |      0.51 | 0.42, 0.60
+#    1.00 |      0.49 | 0.39, 0.59
+#    1.40 |      0.46 | 0.36, 0.57
+#    2.40 |      0.41 | 0.28, 0.55
+#
+#Adjusted for:
+#*        deltaAGE = -0.21
+#*           Morph =     B
+#*          avgAGE =  5.74
+#*           windC = -0.12
+#*      windBIRTHC =  0.09
+#*      nacimiento = 0 (population-level)
+#*            year = 0 (population-level)
+#*           Metal = 0 (population-level)
+#* location_9sites = 0 (population-level)
+
+datc <- ggpredict(fem.offs.wGLMER, term = c("windC"))
+print(datc, n=10)
+femMARGeffsWINDLL <- as.data.frame(datc)
+write.csv(femMARGeffsWINDLL, "femMARGeffsWINDLL.csv", row.names = F)
+#windC | Predicted |     95% CI
+#------------------------------
+#-2.44 |      0.78 | 0.65, 0.87
+#-2.16 |      0.75 | 0.63, 0.84
+#-1.12 |      0.66 | 0.56, 0.74
+#-0.76 |      0.62 | 0.52, 0.70
+#-0.45 |      0.58 | 0.49, 0.67
+#-0.28 |      0.57 | 0.48, 0.65
+# 0.41 |      0.49 | 0.40, 0.58
+# 0.72 |      0.45 | 0.36, 0.55
+# 1.08 |      0.41 | 0.31, 0.52
+# 3.52 |      0.19 | 0.09, 0.36
+#
+#Adjusted for:
+#*        deltaAGE = -0.21
+#*           Morph =     B
+#*          avgAGE =  5.74
+#*        layingST = -0.08
+#*      windBIRTHC =  0.09
+#*      nacimiento = 0 (population-level)
+#*            year = 0 (population-level)
+#*           Metal = 0 (population-level)
+#* location_9sites = 0 (population-level)
+
+```
+
+
+```{r model residuals f w}
+
+res.devian <- residuals(fem.offs.w, type="pearson")   
+##  DHARMa standardised resid 0-1
+res.dharma <- simulateResiduals(fem.offs.w)$scaledResiduals
+plot(res.devian, res.dharma)
+plot(rank(res.devian), res.dharma)
+
+##  GLOBAL DIAGNOSIS 
+testUniformity(fem.offs.w) #normality
+#D = 0.062771, p-value = 0.2654
+testQuantiles(fem.offs.w) #heteroscedasticity
+#p-value = 0.9748
+testOutliers(fem.offs.w) 
+#no outliers
+testZeroInflation(fem.offs.w)
+#no inflation: ratioObsSim = 1.0214, p-value = 0.16
+
+##   plots all at once
+plot(simulateResiduals(fem.offs.w))
+
+##   only for Poisson or binomial; has to be close to 1
+testDispersion(fem.offs.w) #dispersion = 0.89925, p-value = 0.112
+##  there is no dispersion but if there were, it can be corrected with argument dispformula
+
+
+```
+
+```{r model results f w}
+summary(fem.offs.w)$coefficients
+
+round(confint(fem.offs.w, level=0.95, method="Wald"), 3)
+##  transform to get response coeff
+round(exp(confint(fem.offs.w, level=0.95, method="Wald")), 3)  
+
+## BOOTSTRAP 
+set.seed(111)
+model.bootstrap <- bootstrap_parameters(fem.offs.w, ci=0.95, iterations=100, centrality="median", test=c("p_direction", "p_map", "p-value"), ci_method=c("BCI"))
+model.bootstrap
+# does not work, some runs fail to converge
+
+
+# random effects
+summary(fem.offs.w)$varcor
+summary(fem.offs.w)$sigma    ## sd for residual error
+summary(update(fem.offs.w, REML=TRUE))$varcor
+summary(update(fem.offs.w, REML=TRUE))$sigma
+
+r.squaredGLMM(update(fem.offs.w, REML=TRUE))    
+r2_nakagawa(update(fem.offs.w, REML=TRUE))
+
+
+sjPlot::tab_model(fem.offs.w,
+        show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/offspringFw.doc")
+```
+
+
+
+
+```{r table w all models}
+sjPlot::tab_model(fem.offs,fem.offs.w,m.offs,m.offs.w,
+        show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/allmod.doc")
+```
+
+
+```{r table w winds models}
+sjPlot::tab_model(fem.offs.w, m.offs.w, transform=NULL,
+        show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/WINDSmods.doc")
+```
+
+
+```{r table w prod models}
+sjPlot::tab_model(fem.offs,m.offs, transform=NULL,
+        show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/PRODmods.doc")
+```
+
+
+
+
+
+
+
+
+### GRAPHS OFFSPRING NUMBER -------
+
+## graph males offs vs LL
+
+```{r graph males prod}
+
+x<-predict(m.offs, EFrepSENseenMcomplete, type = "response", se.fit = TRUE)
+x<-as.data.frame(x)
+x$offsPRED <- x$fit*3
+x$offsSE <- x$se.fit*3
+x <- x[,-c(1:2)]
+
+EFrepSENseenMcomplete <- cbind(EFrepSENseenMcomplete,x)
+
+
+
+
+q <- ggplot(EFrepSENseenMcomplete,aes(x=prodC,y=offsPRED))+
+  geom_smooth(colour="black",  linetype="solid", size=1, method="lm")+  scale_y_continuous(expand=c(0,0),limits = c(-0.2, 3.1),breaks = c(0,1,2,3))+
+  labs(y="Annual offspring number",x="Productivity (scaled)")+ 
+  theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=22,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=22, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+q+geom_point(data=EFrepSENseenMcomplete, 
+                  aes(x=prodC, y=OffspringNUM),
+                  shape=21, position = position_jitter(width = 0.5,height = 0.05),
+                  size=2, fill="black", inherit.aes = FALSE)
+ggsave("m_offspring num vs productivity_glmmTMB.png", width=30, height=22, unit="cm", dpi=600)
+
+
+```
+
+
+```{r graph males winds}
+
+x<-predict(m.offs.w, EFrepSENseenMcomplete, type = "response", se.fit = TRUE)
+x<-as.data.frame(x)
+x$offsPREDw <- x$fit*3
+x$offsSEw <- x$se.fit*3
+x <- x[,-c(1:2)]
+
+EFrepSENseenMcomplete <- cbind(EFrepSENseenMcomplete,x)
+
+q <- ggplot(EFrepSENseenMcomplete,aes(x=windC,y=offsPREDw))+
+  geom_smooth( method='lm',linetype="solid",colour="black",linewidth=1)+
+    scale_y_continuous(expand=c(0,0),limits = c(-0.2, 3.1),breaks = c(0,1,2,3))+
+  labs(y="Annual offspring number",x="Wind intensity (scaled)")+ 
+  theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=22,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=22, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+q+geom_point(data=EFrepSENseenMcomplete, 
+                  aes(x=windC, y=OffspringNUM),
+                  shape=21, position = position_jitter(width = 0.5,height = 0.05),
+                  size=2, fill="black", inherit.aes = FALSE)
+ggsave("m_offspring num vs winds_glmmTMB.png", width=30, height=22, unit="cm", dpi=600)
+
+
+
+```
+
+## graph females offs vs LL
+
+```{r graph f prod}
+
+x<-predict(fem.offs, EFrepSENseenFcomplete, type = "response", se.fit = TRUE)
+x<-as.data.frame(x)
+x$offsPRED <- x$fit*3
+x$offsSE <- x$se.fit*3
+x <- x[,-c(1:2)]
+
+EFrepSENseenFcomplete <- cbind(EFrepSENseenFcomplete,x)
+
+q <- ggplot(EFrepSENseenFcomplete,aes(x=prodC,y=offsPRED))+
+  geom_smooth( method='lm',linetype="solid",colour="black",linewidth=1)+
+  scale_y_continuous(expand=c(0,0),limits = c(-0.2, 3.1),breaks = c(0,1,2,3))+
+  labs(y="Annual offspring number",x="Productivity (scaled)")+ 
+  theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=22,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=22, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+q+geom_point(data=EFrepSENseenFcomplete, 
+                  aes(x=prodC, y=OffspringNUM),
+                  shape=21, position = position_jitter(width = 0.5,height = 0.05),
+                  size=2, fill="black", inherit.aes = FALSE)
+ggsave("fem_offspring num vs productivity_glmmTMB.png", width=30, height=22, unit="cm", dpi=600)
+
+
+```
+
+
+```{r graph f winds}
+
+x<-predict(fem.offs.w, EFrepSENseenFcomplete, type = "response", se.fit = TRUE)
+x<-as.data.frame(x)
+x$offsPREDw <- x$fit*3
+x$offsSEw <- x$se.fit*3
+x <- x[,-c(1:2)]
+
+EFrepSENseenFcomplete <- cbind(EFrepSENseenFcomplete,x)
+
+q <- ggplot(EFrepSENseenFcomplete,aes(x=windC,y=offsPREDw))+
+  geom_smooth( method='lm',linetype="solid",colour="black",linewidth=1)+
+    scale_y_continuous(expand=c(0,0),limits = c(-0.2, 3.1),breaks = c(0,1,2,3))+
+  labs(y="Annual offspring number",x="Wind intensity (scaled)")+ 
+  theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=22,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=22, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+q+geom_point(data=EFrepSENseenFcomplete, 
+                  aes(x=windC, y=OffspringNUM),
+                  shape=21, position = position_jitter(width = 0.5,height = 0.05),
+                  size=2, fill="black", inherit.aes = FALSE)
+ggsave("fem_offspring num vs winds_glmmTMB.png", width=30, height=22, unit="cm", dpi=600)
+
+
+
+```
+
+
+## combined m and f graph offs num vs delta age sq*morph
+
+
+```{r combined graph OFFS NUM vs QUADRATIC DELTA AGE * MORPH}
+
+x<-predict(fem.offs.w, EFrepSENseenFcomplete, type = "response", se.fit = TRUE)
+x<-as.data.frame(x)
+x$offsPREDw <- x$fit*3 # transform predicted prob to offspring number
+x$offsSEw <- x$se.fit*3
+x <- x[,-c(1:2)]
+range(x$offsPREDw) #0.3183184 2.9612888
+EFrepSENseenFcomplete <- cbind(EFrepSENseenFcomplete,x)
+str(EFrepSENseenFcomplete)
+
+str(EFrepSENseenMcomplete)
+EFrepSENseenMcomplete$offsPREDw<-NA
+EFrepSENseenMcomplete$offsSEw<-NA
+EFrepSENseenFMcomplete <- rbind(EFrepSENseenFcomplete,EFrepSENseenMcomplete)
+levels(EFrepSENseenFMcomplete$Sexo)[levels(EFrepSENseenFMcomplete$Sexo)=="H"] <- "female"
+levels(EFrepSENseenFMcomplete$Sexo)[levels(EFrepSENseenFMcomplete$Sexo)=="M"] <- "male"
+str(EFrepSENseenFMcomplete)
+
+#summarising data per age group
+# 9 groups of 21 ind and 2 groups of 19 ind (11 groups/points, N=227 pale morph) fem
+# 9 groups of 3 ind and 1 groups of 2 ind (10 groups/points, N=29 dark morph) fem
+
+# 9 groups of 21 ind, 1 group of 20 and 1 group of 19 ind (11 groups/points, N=228 pale morph, males; groups 30-40)
+# 9 groups of 8 ind and 1 group of 9 ind (10 groups/points, N=81 dark morph, males; groups 41-50)
+## then order by delta age, create seq in 'seqPLOTdelta'
+
+#to get sequence in excel faster write manually first set of numbers (i.e. 6 cells with 1), then in the next cell insert formula  =A1+1 (in the first cell of 2nd sequence), and pull down formula
+fmMEANSd <- EFrepSENseenFMcomplete[,c(1,3,4,32)]
+write.csv(fmMEANSd,"fmMEANSd.csv",row.names = F)
+rm(fmMEANSd)
+#import new table with seqPLOTdelta
+fmMEANSd <- as.data.frame(fmMEANSd)
+fmMEANSd[,c(2,3,5)] <- lapply(fmMEANSd[,c(2,3,5)], factor)
+
+#summarising data per age group
+fmMEANSda <- summarySEwithin(fmMEANSd,
+                           measurevar="OffspringNUM",  withinvars=c("seqPLOTdelta","Morph", "Sexo"),
+                               na.rm=FALSE, conf.interval=.95)
+fmMEANSdb <- summarySEwithin(fmMEANSd,
+                           measurevar="deltaAGE",  withinvars=c("seqPLOTdelta","Morph", "Sexo"),
+                               na.rm=FALSE, conf.interval=.95)
+fmMEANSda <- fmMEANSda[,c(1,2,3,5,8)]
+fmMEANSdb <- fmMEANSdb[,c(1,2,3,5)]
+fmMEANSdc <- left_join(fmMEANSda,fmMEANSdb, by=c("seqPLOTdelta", "Morph", "Sexo"))
+fmMEANSd <- fmMEANSdc[,c(-1)]
+str(fmMEANSd)
+fmMEANSd$offsPREDw <- fmMEANSd$OffspringNUM
+levels(fmMEANSd$Sexo)[levels(fmMEANSd$Sexo)=="f"] <- "female"
+levels(fmMEANSd$Sexo)[levels(fmMEANSd$Sexo)=="m"] <- "male"
+
+
+
+p <- ggplot(EFrepSENseenFMcomplete, aes(x = deltaAGE, y = offsPREDw))+
+  geom_smooth(data=subset(EFrepSENseenFMcomplete, Morph== "N" & Sexo== "female"), method='lm',
+              formula=y~poly(x,2), linetype="solid", colour = "black", #border colour
+              fill = "#666666", alpha=0.2)+# use fill = NA or alpha=0 if only border
+  geom_smooth(data=subset(EFrepSENseenFMcomplete, Morph== "B" & Sexo== "female"),method='lm',
+              colour = "black",linetype="dashed",
+              fill = "#CCCCCC", alpha=0.4)+
+    labs(x="\u03B4\ age in years (within-individual effects)",
+         y="Annual offspring number (no. of fledglings)") +
+  facet_wrap(~Sexo)+
+        scale_y_continuous(breaks = c(0,1,2, 3)) +   
+    theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=30),
+        axis.title.y = element_text(size=30, vjust=0.3),
+        axis.text.x=element_text(size=26,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=26, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(), 
+        legend.title=element_text(face="bold", size=18),
+        legend.text=element_text(size=26),
+        strip.text = element_text(size = 26),#this makes font size in facet
+        strip.background = element_rect(fill="white"),
+        strip.text.x = element_text(margin = margin(0.4,0,0.4,0, "cm")),
+        panel.spacing = unit(1.5, "lines"))+
+  geom_errorbar(data=subset(fmMEANSd,Morph=="N" & Sexo=="female"), colour="black", 
+                width=.2, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fmMEANSd,Morph=="N" & Sexo=="female"), 
+                  aes(x=deltaAGE, y=offsPREDw),shape=21, 
+                  size=5, fill="#999999", colour="black", inherit.aes = FALSE)+
+  geom_errorbar(data=subset(fmMEANSd,Morph=="B" & Sexo=="female"), colour="#999999",
+                position=position_dodge(width=0.2),
+                width=.2, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fmMEANSd,Morph=="B" & Sexo=="female"), 
+                  aes(x=deltaAGE, y=offsPREDw),shape=21,
+                  position=position_dodge(width=0.2),
+                  size=5, fill="white", colour="black",inherit.aes = FALSE)+
+  geom_errorbar(data=subset(fmMEANSd,Morph=="N" & Sexo=="male"), colour="black",
+                width=.2, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fmMEANSd,Morph=="N" & Sexo=="male"), 
+                  aes(x=deltaAGE, y=offsPREDw),shape=21, 
+                  size=5, fill="#999999", colour="black", inherit.aes = FALSE)+
+  geom_errorbar(data=subset(fmMEANSd,Morph=="B" & Sexo=="male"), colour="#999999",
+                position=position_dodge(width=0.2),
+                width=.2, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fmMEANSd,Morph=="B" & Sexo=="male"), 
+                  aes(x=deltaAGE, y=offsPREDw),shape=21, 
+                  position=position_dodge(width=0.2),
+                  size=5, fill="white", colour="black",inherit.aes = FALSE)
+  
+ggsave("fm_delta age*morph_glmmTMB_noRAWbutAVG.png", width=50, height=30, unit="cm", dpi=600)
+
+
+
+
+
+
+# old code for females only graph
+# export and manually create sequence so I have 
+## then order by delta age, create seq in 'seqPLOTdelta'
+#to get sequence in excel faster write manually first set of numbers (i.e. 6 cells with 1), then do =A1+1 in the next cell (first cell of 2), and pull down formula
+fMEANS <- EFrepSENseenFcomplete[,c(1,4,32)]
+write.csv(fMEANS,"fMEANS.csv",row.names = F)
+rm(fMEANS)
+#import new table with seqPLOTdelta
+fMEANS <- as.data.frame(fMEANS)
+fMEANS[,c(2,4)] <- lapply(fMEANS[,c(2,4)], factor)
+
+#summarising data per age group
+fMEANSa <- summarySEwithin(fMEANS,
+                           measurevar="OffspringNUM",  withinvars=c("seqPLOTdelta","Morph"),
+                               na.rm=FALSE, conf.interval=.95)
+fMEANSb <- summarySEwithin(fMEANS,
+                           measurevar="deltaAGE",  withinvars=c("seqPLOTdelta","Morph"),
+                               na.rm=FALSE, conf.interval=.95)
+fMEANSa <- fMEANSa[,c(1,2,4,7)]
+fMEANSb <- fMEANSb[,c(1,4)]
+fMEANSc <- left_join(fMEANSa,fMEANSb, by="seqPLOTdelta")
+fMEANS <- fMEANSc[,c(-1)]
+fMEANS$offsPREDw <- fMEANS$OffspringNUM
+
+p <- ggplot(EFrepSENseenFcomplete, aes(x = deltaAGE, y = offsPREDw))+
+  geom_smooth(data=subset(EFrepSENseenFcomplete, Morph== "N"), method='lm',
+              formula=y~poly(x,2), linetype="solid", colour = "black", #border colour
+              fill = "#666666", alpha=0.2)+# use fill = NA or alpha=0 if only border
+  geom_smooth(data=subset(EFrepSENseenFcomplete, Morph== "B"),method='lm',
+              colour = "black",linetype="dashed",
+              fill = "#CCCCCC", alpha=0.4)+
+  labs(x="\u03B4\ age in years (within-individual effects)",y="Annual offspring number (no. of fledglings)")+
+  geom_errorbar(data=subset(fMEANS,Morph=="N"), colour="black", 
+                width=.1, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fMEANS,Morph=="N"), 
+                  aes(x=deltaAGE, y=offsPREDw),shape=21, 
+                  size=4.5, fill="#999999", colour="black", inherit.aes = FALSE)+
+  geom_errorbar(data=subset(fMEANS,Morph=="B"), colour="#999999",
+                width=.2, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fMEANS,Morph=="B"), 
+                  aes(x=deltaAGE, y=offsPREDw),shape=21,
+                  size=4, fill="white", colour="black",inherit.aes = FALSE)+
+    theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=30),
+        axis.title.y = element_text(size=30, vjust=0.3),
+        axis.text.x=element_text(size=26,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=26, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(), 
+        legend.title=element_text(face="bold", size=16),
+        legend.text=element_text(size=16),
+        legend.position.inside =  c(.95, .95),
+        legend.justification = c("right", "top"),
+        legend.box.just = "right",
+        legend.margin = margin(6, 6, 6, 6))
+ggsave("f_delta age*morph_glmer_wRAWavg.png", width=37, height=30, unit="cm", dpi=600)
+
+
+#delete raw points to replace by avg
+#geom_point(data=subset(EFrepSENseenFcomplete,Morph=="N"), 
+#                  aes(x=deltaAGE, y=OffspringNUM),shape=21, 
+#                  position=position_jitter(width=0.5, height=0.05),
+#                  size=3.5, fill="#999999", colour="black", inherit.aes = FALSE)+
+#  geom_point(data=subset(EFrepSENseenFcomplete,Morph=="B"), 
+#                  aes(x=deltaAGE, y=OffspringNUM),shape=21, 
+#                  position=position_jitter(width=0.5, height=0.05),
+#                  size=3, fill="white", colour="black",inherit.aes = FALSE)
+```
+
+
+
+## combined avg age male & female/male graphs
+
+```{r combined avg age graph}
+
+
+x<-predict(fem.offs.w, EFrepSENseenFcomplete, type = "response", se.fit = TRUE)
+x<-as.data.frame(x)
+x$offsPREDw <- x$fit*3 # transform predicted prob to offspring number
+x$offsSEw <- x$se.fit*3
+x <- x[,-c(1:2)]
+range(x$offsPREDw) #0.3183184 2.9612888
+EFrepSENseenFcomplete <- cbind(EFrepSENseenFcomplete,x)
+str(EFrepSENseenFcomplete)
+
+x<-predict(m.offs.w, EFrepSENseenMcomplete, type = "response", se.fit = TRUE)
+x<-as.data.frame(x)
+x$offsPREDw <- x$fit*3 # transform predicted prob to offspring number
+x$offsSEw <- x$se.fit*3
+x <- x[,-c(1:2)]
+range(x$offsPREDw) #0.226687 2.582248
+EFrepSENseenMcomplete <- cbind(EFrepSENseenMcomplete,x)
+str(EFrepSENseenMcomplete)
+EFrepSENseenFMcomplete <- rbind(EFrepSENseenFcomplete,EFrepSENseenMcomplete)
+levels(EFrepSENseenFMcomplete$Sexo)[levels(EFrepSENseenFMcomplete$Sexo)=="H"] <- "female"
+levels(EFrepSENseenFMcomplete$Sexo)[levels(EFrepSENseenFMcomplete$Sexo)=="M"] <- "male"
+str(EFrepSENseenFMcomplete)
+
+
+#summarising data per age group
+# export and manually create sequence so I have 
+# 9 groups of 21 ind and 2 groups of 19 ind (11 groups/points, N=227 pale morph, females; groups 1-11)
+# 9 groups of 3 ind and 1 groups of 2 ind (10 groups/points, N=29 dark morph, females; groups 23-32)
+# 9 groups of 21 ind, 1 group of 20 and 1 group of 19 ind (11 groups/points, N=228 pale morph, males; groups 12-22)
+# 9 groups of 8 ind and 1 group of 9 ind (10 groups/points, N=81 dark morph, males; groups 33-42)
+## then order by avg age, create seq in 'seqPLOTavg'
+#to get sequence in excel faster write manually first set of numbers (i.e. 6 cells with 1), then in the next cell insert formula  =A1+1 (in the first cell of 2nd sequence), and pull down formula
+fmMEANS <- EFrepSENseenFMcomplete[,c(1,3,4,31)]
+write.csv(fmMEANS,"fmMEANS.csv",row.names = F)
+rm(fmMEANS)
+#import new table with seqPLOTavg
+fmMEANS <- as.data.frame(fmMEANS)
+fmMEANS[,c(2,3,5)] <- lapply(fmMEANS[,c(2,3,5)], factor)
+
+#summarising data per age group
+fmMEANSa <- summarySEwithin(fmMEANS,
+                           measurevar="OffspringNUM",  withinvars=c("seqPLOTavg","Morph", "Sexo"),
+                               na.rm=FALSE, conf.interval=.95)
+fmMEANSb <- summarySEwithin(fmMEANS,
+                           measurevar="avgAGE",  withinvars=c("seqPLOTavg","Morph", "Sexo"),
+                               na.rm=FALSE, conf.interval=.95)
+fmMEANSa <- fmMEANSa[,c(1,2,3,5,8)]
+fmMEANSb <- fmMEANSb[,c(1,2,3,5)]
+fmMEANSc <- left_join(fmMEANSa,fmMEANSb, by=c("seqPLOTavg", "Morph", "Sexo"))
+fmMEANS <- fmMEANSc[,c(-1)]
+fmMEANS$offsPREDw <- fmMEANS$OffspringNUM
+levels(fmMEANS$Sexo)[levels(fmMEANS$Sexo)=="f"] <- "female"
+levels(fmMEANS$Sexo)[levels(fmMEANS$Sexo)=="m"] <- "male"
+str(fmMEANS)
+
+p <- ggplot(EFrepSENseenFMcomplete, aes(x = avgAGE, y = offsPREDw))+
+  geom_smooth(data=subset(EFrepSENseenFMcomplete, Morph== "N" & Sexo== "female"), method='lm',
+              formula=y~poly(x,2), linetype="solid", colour = "black", #border colour
+              fill = "#666666", alpha=0.2)+# use fill = NA or alpha=0 if only border
+  geom_smooth(data=subset(EFrepSENseenFMcomplete, Morph== "B" & Sexo== "female"),method='lm',
+              formula=y~poly(x,2), 
+              colour = "black",linetype="dashed",
+              fill = "#CCCCCC", alpha=0.4)+
+  geom_smooth(data=subset(EFrepSENseenFMcomplete, Sexo== "male"),method='lm',
+                colour = "black",linetype="dotted",
+              fill = "#999999", alpha=0.4)+
+    labs(x="\U003BC\ age in years (between-individual effects)",
+         y="Annual offspring number (no. of fledglings)") +
+  facet_wrap(~Sexo)+
+      scale_x_continuous(limits = c(2, 13), breaks = c(2, 4, 6,8, 10,12)) +  
+        scale_y_continuous(breaks = c(0,1,2, 3)) +   
+    theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=30),
+        axis.title.y = element_text(size=30, vjust=0.3),
+        axis.text.x=element_text(size=26,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=26, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(), 
+        legend.title=element_text(face="bold", size=18),
+        legend.text=element_text(size=26),
+        strip.text = element_text(size = 26),#this makes font size in facet
+        strip.background = element_rect(fill="white"),
+        strip.text.x = element_text(margin = margin(0.4,0,0.4,0, "cm")),
+        panel.spacing = unit(1.5, "lines"))+
+  geom_errorbar(data=subset(fmMEANS,Morph=="N" & Sexo=="female"), colour="black", 
+                width=.2, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fmMEANS,Morph=="N" & Sexo=="female"), 
+                  aes(x=avgAGE, y=offsPREDw),shape=24, 
+                  size=5, fill="#999999", colour="black", inherit.aes = FALSE)+
+  geom_errorbar(data=subset(fmMEANS,Morph=="B" & Sexo=="female"), colour="#999999",
+                position=position_dodge(width=0.2),
+                width=.2, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fmMEANS,Morph=="B" & Sexo=="female"), 
+                  aes(x=avgAGE, y=offsPREDw),shape=24,
+                  position=position_dodge(width=0.2),
+                  size=5, fill="white", colour="black",inherit.aes = FALSE)+
+  geom_errorbar(data=subset(fmMEANS,Morph=="N" & Sexo=="male"), colour="black",
+                width=.2, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fmMEANS,Morph=="N" & Sexo=="male"), 
+                  aes(x=avgAGE, y=offsPREDw),shape=24, 
+                  size=5, fill="#999999", colour="black", inherit.aes = FALSE)+
+  geom_errorbar(data=subset(fmMEANS,Morph=="B" & Sexo=="male"), colour="#999999",
+                position=position_dodge(width=0.2),
+                width=.2, aes(ymin=offsPREDw-se, ymax=offsPREDw+se))+
+  geom_point(data=subset(fmMEANS,Morph=="B" & Sexo=="male"), 
+                  aes(x=avgAGE, y=offsPREDw),shape=24, 
+                  position=position_dodge(width=0.2),
+                  size=5, fill="white", colour="black",inherit.aes = FALSE)
+  
+ggsave("fm_avg age*morph_glmmTMB_noRAWbutAVG.png", width=50, height=30, unit="cm", dpi=600)
+
+#can't fix dodge, used dodge2 and jitter and doesnt work well
+## took the actual raw points away bc they were not informative
+# +geom_point(data=subset(EFrepSENseenFMcomplete,Morph=="N"), 
+#                  aes(x=avgAGE, y=OffspringNUM),shape=21, 
+#                  position=position_jitter(width=0.5, height=0.05),
+#                  size=2.5, fill="#999999", colour="black", inherit.aes = FALSE)+
+#  geom_point(data=subset(EFrepSENseenFMcomplete,Morph=="B"), 
+#                  aes(x=avgAGE, y=OffspringNUM),shape=21, 
+#                  position=position_jitter(width=0.5, height=0.05),
+#                  size=2, fill="white", colour="black",inherit.aes = FALSE)+
+
+```
+
+
+## graph females vs laying date
+
+
+```{r graph f prod laying}
+
+x<-predict(fem.offs, EFrepSENseenFcomplete, type = "response", se.fit = TRUE)
+x<-as.data.frame(x)
+x$offsPRED <- x$fit*3
+x$offsSE <- x$se.fit*3
+x <- x[,-c(1:2)]
+
+EFrepSENseenFcomplete <- cbind(EFrepSENseenFcomplete,x)
+
+q <- ggplot(EFrepSENseenFcomplete,aes(x=layingST,y=offsPRED))+
+  geom_smooth( method='lm',linetype="solid",colour="black",linewidth=1)+
+  scale_y_continuous(expand=c(0,0),limits = c(-0.2, 3.1),breaks = c(0,1,2,3))+
+  labs(y="Annual offspring number",x="Laying date (scaled)")+ 
+  theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=22,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=22, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+q+geom_point(data=EFrepSENseenFcomplete, 
+                  aes(x=prodC, y=OffspringNUM),
+                  shape=21, position = position_jitter(width = 0.5,height = 0.05),
+                  size=2, fill="black", inherit.aes = FALSE)
+ggsave("fem_offspring num vs laying_prod_glmmTMB.png", width=30, height=30, unit="cm", dpi=600)
+
+
+```
+
+
+```{r graph f winds laying}
+
+x<-predict(fem.offs.w, EFrepSENseenFcomplete, type = "response", se.fit = TRUE)
+x<-as.data.frame(x)
+x$offsPREDw <- x$fit*3
+x$offsSEw <- x$se.fit*3
+x <- x[,-c(1:2)]
+
+EFrepSENseenFcomplete <- cbind(EFrepSENseenFcomplete,x)
+
+q <- ggplot(EFrepSENseenFcomplete,aes(x=layingST,y=offsPREDw))+
+  geom_smooth( method='lm',linetype="solid",colour="black",linewidth=1)+
+    scale_y_continuous(expand=c(0,0),limits = c(-0.2, 3.1),breaks = c(0,1,2,3))+
+  labs(y="Annual offspring number",x="Laying date (scaled)")+ 
+  theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=22,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=22, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+q+geom_point(data=EFrepSENseenFcomplete, 
+                  aes(x=windC, y=OffspringNUM),
+                  shape=21, position = position_jitter(width = 0.5,height = 0.05),
+                  size=2, fill="black", inherit.aes = FALSE)
+ggsave("fem_offspring num vs laying_winds_glmmTMB.png", width=30, height=22, unit="cm", dpi=600)
+
+
+
+```
+
+
+
+## graph males delta age vs EL env
+
+
+```{r graph m delta age vs EL}
+
+#prep means from raw data
+x1 <- EFrepSENseenMcomplete2$windBIRTHyr
+EFrepSENseenMcomplete2$ELwind_3group <-
+  case_when(x1 > mean(x1,na.rm=T)+sd(x1,na.rm=T) ~ "low-quality EL",
+            x1 < mean(x1,na.rm=T)+sd(x1,na.rm=T) & x1 >  mean(x1,na.rm=T)-sd(x1,na.rm=T) ~ "benign EL",
+            x1 < mean(x1,na.rm=T)-sd(x1,na.rm=T) ~ "high-quality EL")
+head(EFrepSENseenMcomplete2$ELwind_3group)
+EFrepSENseenMcomplete2$ELwind_3group <- as.factor(EFrepSENseenMcomplete2$ELwind_3group)
+summary(EFrepSENseenMcomplete2$ELwind_3group)
+#   -1SD +1SD mean 
+#    74   46  189  
+
+EFrepSENseenMcomplete2$ELwind_3group <- factor(EFrepSENseenMcomplete2$ELwind_3group, levels = c("low-quality EL", "benign EL","high-quality EL"))
+
+m.offs.wGLMERgraph <- glmer(cbind(OffspringNUM, (3-OffspringNUM))~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*ELwind_3group+
+                     windC*ELwind_3group+
+                  #random effects
+                    (1|nacimiento)+(1|year)+(1|Metal)+(1|location_9sites), 
+                    data=EFrepSENseenMcomplete2,
+                    family=binomial(link="logit"), nAGQ=1, 
+                    glmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                 optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)))
+
+summary(m.offs.wGLMERgraph)
+#only w high-quality env there's a trend, so only plotting that smooth line
+#                                             Estimate Std. Error z value Pr(>|z|)    
+# I(deltaAGE^2):ELwind_3grouphigh-quality EL -0.323441   0.177806  -1.819   0.0689 .  
+
+
+EFrepSENseenMcomplete2$pred <- predict(m.offs.wGLMERgraph,newdata=EFrepSENseenMcomplete2, type="response")
+range(EFrepSENseenMcomplete2$pred) # 0.04740061 0.84829735
+EFrepSENseenMcomplete2$predT <- EFrepSENseenMcomplete2$pred*3
+range(EFrepSENseenMcomplete2$predT) # 0.1422018 2.5448921
+
+
+#summarising data per age group
+# export and manually create sequence so I have 
+# 9 groups of 14 ind, 1 group of 16 (10 groups/points, N=142 pale morph, males, benign; groups 1-10)
+# 10 groups of 5 ind, 1 group of 6 (11 groups/points, N=56 pale morph, males, high; groups 11-21)
+# 6 groups of 4 ind and 2 groups of 3 ind (8 groups/points, N=30 pale morph, males, low; groups 22-29)
+# 7 groups of 6 ind, 1 group of 5 (8 groups/points, N=47 dark morph, males, benign; groups 30-37)
+# 3 groups of 4 ind, 2 groups of 3 (5 groups/points, N=18 dark morph, males, high; groups 38-42)
+# 4 groups of 3 ind and 1 group of 4 ind (5 groups/points, N=16 dark morph, males, low; groups x-x)
+## in excel order by delta age, create seq in 'seqPLOTavg'
+## to get sequence in excel faster write manually first set of numbers (i.e. 6 cells with 1), then in the next cell insert formula  =A1+1 (in the first cell of 2nd sequence), and pull down formula
+mMEANSel <- EFrepSENseenMcomplete2[,c(1,2,4,32,40)]
+write.csv(mMEANSel,"mMEANSel.csv",row.names = F)
+rm(mMEANSel)
+#import new table with seqPLOTdelta
+mMEANSel <- as.data.frame(mMEANSel)
+names(mMEANSel)
+mMEANSel[,c(2,3,5,6)] <- lapply(mMEANSel[,c(2,3,5,6)], factor)
+
+#summarising data per age group
+mMEANSela <- summarySEwithin(mMEANSel,
+                           measurevar="OffspringNUM",  withinvars=c("seqPLOTdelta","Morph","ELwind_3group"),
+                               na.rm=FALSE, conf.interval=.95)
+mMEANSelb <- summarySEwithin(mMEANSel,
+                           measurevar="deltaAGE",  withinvars=c("seqPLOTdelta","Morph","ELwind_3group"),
+                               na.rm=FALSE, conf.interval=.95)
+names(mMEANSela)
+mMEANSela <- mMEANSela[,c(1,2,3,5,8)]
+mMEANSelb <- mMEANSelb[,c(1,2,3,5)]
+mMEANSelc <- left_join(mMEANSela,mMEANSelb, by=c("seqPLOTdelta", "Morph","ELwind_3group"))
+mMEANSel <- mMEANSelc[,c(-1)]
+mMEANSel$predT <- mMEANSel$OffspringNUM
+
+
+# now with facet_wrap in colour
+pA <- ggplot(EFrepSENseenMcomplete2,aes(x=deltaAGE,y=OffspringNUM))+
+        facet_wrap(~ELwind_3group, scales="free_x")+
+  geom_smooth(data=subset(EFrepSENseenMcomplete2, ELwind_3group== "high-quality EL"), aes(x=deltaAGE, y=predT),
+          colour="black",linetype="longdash", method='lm',formula=y~poly(x,2), 
+          linewidth=1)+
+    labs(x="\u03B4\ age (within-individual effects)",y="Annual offspring number") +
+  geom_errorbar(data=subset(mMEANSel,Morph=="N"), colour="black", 
+                width=.2, aes(ymin=predT-se, ymax=predT+se))+
+  geom_point(data=subset(mMEANSel,Morph=="N"), 
+                  aes(x=deltaAGE, y=predT),shape=21, 
+                  size=5, fill="#999999", colour="black", inherit.aes = FALSE)+
+  geom_errorbar(data=subset(mMEANSel,Morph=="B"), colour="#999999",
+                position=position_dodge(width=0.2),
+                width=.2, aes(ymin=predT-se, ymax=predT+se))+
+  geom_point(data=subset(mMEANSel,Morph=="B"), 
+                  aes(x=deltaAGE, y=predT),shape=21,
+                  position=position_dodge(width=0.2),
+                  size=5, fill="white", colour="black",inherit.aes = FALSE)+
+    theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=18,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=18, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+         strip.text = element_text(size = 26),#this makes font size in facet
+        strip.background = element_rect(fill="white"),
+        strip.text.x = element_text(margin = margin(0.4,0,0.4,0, "cm")),
+        panel.spacing = unit(1.5, "lines"))
+ggsave("m_del age*EL_offs num_glmer.png", width=34, height=22, unit="cm", dpi=600)
+
+
+
+  
+
+
+```
+
+
+## graph males EL vs LL env
+
+
+```{r graph m LL vs EL}
+
+
+EFrepSENseenMcomplete2$ELwind_3group <- factor(EFrepSENseenMcomplete2$ELwind_3group, levels = c("low-quality EL", "benign EL","high-quality EL"))
+
+m.offs.wGLMERgraph <- glmer(cbind(OffspringNUM, (3-OffspringNUM))~
+                  #quadratic fixed effects
+                     I(deltaAGE^2)*Morph + 
+                     I(avgAGE^2)*Morph + 
+                  #linear fixed effects 
+                     deltaAGE+avgAGE+ 
+                     layingST+I(deltaAGE^2)*windC+
+                     I(deltaAGE^2)*ELwind_3group+
+                     windC*ELwind_3group+
+                  #random effects
+                    (1|nacimiento)+(1|year)+(1|Metal)+(1|location_9sites), 
+                    data=EFrepSENseenMcomplete2,
+                    family=binomial(link="logit"), nAGQ=1, 
+                    glmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                 optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)))
+
+summary(m.offs.wGLMERgraph)
+#only w high-quality EL env there's a trend and bening effect, so only plotting those smooth lines
+#                                     Estimate Std. Error z value Pr(>|z|)    
+# windC:ELwind_3groupbenign EL               -0.424974   0.187742  -2.264   0.0236 *
+# windC:ELwind_3grouphigh-quality EL         -0.544980   0.311285  -1.751   0.0800 . 
+
+
+
+pB <- ggplot(EFrepSENseenMcomplete2,aes(x=windC,y=OffspringNUM))+
+        facet_wrap(~ELwind_3group, scales="free_x")+
+  geom_smooth(data=subset(EFrepSENseenMcomplete2, ELwind_3group== "high-quality EL"), aes(x=windC, y=predT),
+          colour="black",linetype="longdash", method='lm',
+          linewidth=1)+
+   geom_smooth(data=subset(EFrepSENseenMcomplete2, ELwind_3group== "low-quality EL"), aes(x=windC, y=predT),
+          colour="black",linetype="longdash", method='lm',
+          linewidth=1)+
+   geom_smooth(data=subset(EFrepSENseenMcomplete2, ELwind_3group== "benign EL"), aes(x=windC, y=predT),
+          colour="black",linetype="longdash", method='lm',
+          linewidth=1)+
+    labs(x="Wind intensity (scaled) LL environment",y="Annual offspring number") +
+  geom_jitter(data=subset(EFrepSENseenMcomplete2,Morph=="N"), 
+                  shape=21, 
+                  size=5, fill="#999999", colour="black")+
+  geom_jitter(data=subset(EFrepSENseenMcomplete2,Morph=="B"), 
+                  shape=21,
+                  size=5, fill="white", colour="black")+
+    theme_bw() +
+    theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=24),
+        axis.title.y = element_text(size=24, vjust=0.3),
+        axis.text.x=element_text(size=18,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=18, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+         strip.text = element_text(size = 26),#this makes font size in facet
+        strip.background = element_rect(fill="white"),
+        strip.text.x = element_text(margin = margin(0.4,0,0.4,0, "cm")),
+        panel.spacing = unit(1.5, "lines"))
+ggsave("m_LL*EL_offs num_glmer.png", width=34, height=22, unit="cm", dpi=600)
+
+
+
+  
+
+
+```
+
+
+
+
+
+
+
+
+## LRS  ------
+
+Model run with both sexes
+
+
+
+```{r model comparison and selection lrs fm winds}
+str(EFlrs) 
+EFlrscomplete<-EFlrs[complete.cases(EFlrs[,c(1:6)]),]
+str(EFlrscomplete)
+
+EFlrsM <- subset(EFlrscomplete, Sexo=="M")
+EFlrsF <- subset(EFlrscomplete, Sexo=="H")
+str(EFlrsM)
+str(EFlrsF)
+
+
+tapply(EFlrsM$lrs, EFlrsM$Morph, range)
+#$B
+#[1]  0 20
+#$N
+#[1]  0 12
+summary(EFlrsM$Morph)
+#B     N 
+#113  29
+EFlrsM$lifespanF <- as.factor(EFlrsM$lifespan)
+summary(EFlrsM$lifespanF)
+#   2  3  4  5  6  7  8  9 10 11 12 13 14 
+#   1 16 27 16 22 21  9 10  9  1  2  7  1  
+
+
+tapply(EFlrsF$lrs, EFlrsF$Morph, range)
+#$B
+#[1]  0 15
+#
+#$N
+#[1]  0 15
+summary(EFlrsF$Morph)
+#B     N 
+#106  12
+EFlrsF$lifespanF <- as.factor(EFlrsF$lifespan)
+summary(EFlrsF$lifespanF)
+#   2  3  4  5  6  7  8  9 10 11 12 13 14 
+#   8 15 15 17 19 10  8  6  5  5  3  5  2
+
+
+options(contrasts=c(factor="contr.sum", ordered="contr.poly"))
+control.tmb <- glmmTMBControl(optCtrl=list(iter.max=5e3, eval.max=5e3), 
+                profile=T,parallel=10)
+control.tmb2 <- glmmTMBControl(optCtrl=list(iter.max=5000, eval.max=5000), parallel=10)
+
+
+
+tmb.1.p <- glmmTMB(lrs ~
+                 scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), REML=FALSE, data=EFlrscomplete, control=control.tmb2,
+                 family=poisson(link="log"))
+#
+tmb.1.cpg <- glmmTMB(lrs ~
+                 scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)++
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento),REML=FALSE, data=EFlrscomplete, control=control.tmb2,
+                 family=compois(link="log"))
+#
+tmb.1.nb <- glmmTMB(lrs ~
+                 scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), REML=FALSE, data=EFlrscomplete, control=control.tmb2,
+                 family=nbinom2(link="log"))
+# 
+tmb.1.pg <- glmmTMB(lrs ~
+                 scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento),REML=FALSE, data=EFlrscomplete, control=control.tmb2,
+                 family=genpois(link="log"))
+# 
+tmb.1.tw <- glmmTMB(lrs ~
+                 scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), REML=FALSE,data=EFlrscomplete,   
+                  control=control.tmb,
+                 family=tweedie(link="log"))
+# 
+#Warning in fitTMB(TMBStruc) :Model convergence problem; false convergence (8). See vignette('troubleshooting')
+tmb.1.p.z <- glmmTMB(lrs ~scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=poisson(link="log"))
+# Warning
+tmb.1.pg.z <- glmmTMB(lrs ~scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=genpois(link="log"))
+# Warning
+tmb.1.nb.z <- glmmTMB(lrs ~scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=nbinom2(link="log"))
+# Warning
+tmb.1.tw.z <- glmmTMB(lrs ~scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento),ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=tweedie(link="log"))
+# Warning
+tmb.1.p.h <- glmmTMB(lrs ~scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=truncated_poisson(link="log"))
+#
+tmb.1.pg.h <- glmmTMB(lrs ~
+                 scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=truncated_genpois(link="log"))
+#
+tmb.1.nb.h <- glmmTMB(lrs ~
+                 scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=truncated_nbinom2(link="log"))
+# 
+val_AICc <- MuMIn::AICc(tmb.1.p, tmb.1.cpg, tmb.1.nb, tmb.1.pg,tmb.1.p.h, tmb.1.pg.h, tmb.1.nb.h)
+
+val_AICc
+#           df     AICc
+#tmb.1.p    13 1109.191
+#tmb.1.cpg  14 1102.084
+#tmb.1.nb   14 1099.523
+#tmb.1.pg   14 1102.783
+#tmb.1.p.h  14 1108.179
+#tmb.1.pg.h 27 1117.599
+#tmb.1.nb.h 27 1116.773
+Weights(na.omit(val_AICc)) # 0.005 0.186 0.669 0.131 0.009 0.000 0.000
+
+## only evaluated models that did not give warning
+
+
+## model selection
+modelMFw <- tmb.1.nb
+
+
+
+```
+
+
+```{r model residuals lrs fm winds}
+
+res.devian <- residuals(modelMFw, type="pearson")   
+##  DHARMa standardised resid 0-1
+res.dharma <- simulateResiduals(modelMFw)$scaledResiduals
+plot(res.devian, res.dharma)
+plot(rank(res.devian), res.dharma)
+
+##  GLOBAL DIAGNOSIS 
+testUniformity(modelMFw) #normality
+#D = 0.046261, p-value = 0.6364
+testQuantiles(modelMFw) #heteroscedasticity
+#p-value = 0.398
+testOutliers(modelMFw) 
+#none
+testZeroInflation(modelMFw)
+#no inflation     ratioObsSim = 0.96198, p-value = 0.992
+
+##   plots all at once
+plot(simulateResiduals(modelMFw))
+
+##   only for Poisson or binomial; has to be close to 1
+testDispersion(modelMFw) #dispersion =  0.90301, p-value = 0.76
+##  there is no dispersion but if there were, it can be corrected with argument dispformula
+
+check_collinearity(modelMFw) 
+DF <- Anova(modelMFw, type=3)[2]
+check_collinearity(modelMFw)$VIF^(1/(2*DF)) 
+
+# 
+#                                                                                                                     DF
+#(Intercept)                                                                                                          1.057224
+#scale(windBIRTHyr, scale = T, center = T)                                                                            1.134035
+#scale(MORPH01, scale = F, center = T)                                                                                1.175269
+#scale(SEX01, scale = F, center = T)                                                                                  1.246908
+#scale(lifespan, scale = T, center = T)                                                                               1.105377
+#scale(windBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T)                                      1.123685
+#scale(windBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T)                                        1.138450
+#scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)                                            1.376638
+#scale(windBIRTHyr, scale = T, center = T):scale(lifespan, scale = T, center = T)                                     1.306983
+#scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T)                                           1.109077
+#scale(windBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)  1.474649
+#scale(windBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T) 1.057224
+
+```
+
+```{r model results lrs fm winds GLMMTMB}
+summary(modelMFw)$coefficients
+
+summary(modelMFw)
+
+#     AIC      BIC   logLik deviance df.resid 
+#   1097.8    1147.6    -534.9    1069.8       245 
+#
+#Random effects:
+#
+#Conditional model:
+# Groups     Name        Variance  Std.Dev. 
+# nacimiento (Intercept) 0.01348  0.1161  
+#Number of obs: 259, groups:  nacimiento, 12
+#
+#Dispersion parameter for genpois family ():  12.7 
+
+round(confint(modelMw, level=0.95, method="Wald"), 3)
+##  transform to get response coeff
+round(exp(confint(modelMFw, level=0.95, method="Wald")), 3)  
+## BOOTSTRAP 
+set.seed(111)
+model.bootstrap <- bootstrap_parameters(modelMw, ci=0.95, iterations=1000, centrality="median", 
+                                         test=c("p_direction", "p_map", "p-value"), ci_method=c("BCI"))
+model.bootstrap
+
+
+Anova(modelMFw, type=3)    ## equivalente a SS de tipo III 
+## use this for fixed effects (not for interactions) 
+##   
+drop1(modelMFw, test="Chisq") 
+## use this for interactions)
+summary(modelMw)$varcor
+summary(modelMw)$sigma    ## sd for residual error
+summary(update(modelMw, REML=TRUE))$varcor
+summary(update(modelMw, REML=TRUE))$sigma
+
+## random eff test
+formula(modelMw)
+model.nomix <- update(modelMw, .~.-(1|nacimiento), REML=F)
+anova(model.nomix, modelMw)
+
+```
+
+```{r bootstrapped coef and p-values}
+range(EFlrscomplete$windBIRTHyr)
+
+lrs.wGLMER <- glmer.nb(lrs ~
+    scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+  scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+     (1|nacimiento), data=EFlrscomplete,nAGQ=1, 
+    glmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                 optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)))
+
+#run takes ~20min.
+mcmc.fixed <- bootMer(lrs.wGLMER, FUN=fixef, nsim=1000, type="parametric", seed=1)
+coef.mcmc.fixed <- as.data.frame(mcmc.fixed$t)
+table_mc <- describe(coef.mcmc.fixed)[,c(1:4,11:12)]
+colnames(table_mc)[4] <- "SE"
+table_mc$Zeta <- table_mc$mean / table_mc$SE
+table_mc$p_boot <- round(2*pnorm(abs(table_mc$Zeta), lower.tail=FALSE), 5)
+table_mc$coef.model <- round(fixef(lrs.wGLMER), 5)
+print(table_mc, digits=5)
+
+#                                                                                                                     vars    n     mean      SE     skew kurtosis     Zeta  p_boot coef.model
+#(Intercept)                                                                                                             1 1000  1.22289 0.07068 -0.17704  0.03607 17.30274 0.00000    1.23337
+#scale(windBIRTHyr, scale = T, center = T)                                                                               2 1000  0.07027 0.05899 -0.03260  0.17294  1.19134 0.23352    0.07127
+#scale(MORPH01, scale = F, center = T)                                                                                   3 1000  0.21872 0.10940 -0.11308  0.34179  1.99923 0.04558    0.22833
+#scale(SEX01, scale = F, center = T)                                                                                     4 1000 -0.04348 0.08879  0.05033  0.08393 -0.48965 0.62438   -0.04581
+#scale(lifespan, scale = T, center = T)                                                                                  5 1000  0.66713 0.05220 -0.11323  0.37187 12.78112 0.00000    0.66906
+#scale(windBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T)                                         6 1000  0.05745 0.11967 -0.08208 -0.01658  0.48004 0.63120    0.05655
+#scale(windBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T)                                           7 1000 -0.01366 0.08609  0.06726  0.08757 -0.15870 0.87390   -0.01087
+#scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)                                               8 1000  0.03647 0.21081  0.13554  0.27930  0.17298 0.86267    0.02441
+#scale(windBIRTHyr, scale = T, center = T):scale(lifespan, scale = T, center = T)                                        9 1000 -0.16018 0.06490 -0.00356 -0.15276 -2.46820 0.01358   -0.15845
+#scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T)                                             10 1000  0.08605 0.08500 -0.02770 -0.04424  1.01242 0.31134    0.08322
+#scale(windBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)    11 1000  0.10227 0.23135  0.07764  0.26885  0.44206 0.65844    0.07887
+#scale(windBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T)   12 1000  0.04878 0.11557  0.03296  0.04361  0.42208 0.67297    0.04968
+```
+
+
+```{r exporting LRS model table fm winds}
+
+    
+sjPlot::tab_model(lrs.wGLMER, 
+        transform=NULL, show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/lrsFMwind.doc")
+```
+
+```{r marginal effects from LRS model}
+# marginal effects from ggeffects package (marginaleffects or margins don't work); also ggemmeans() or ggeffect() from this packaged don't work, gives either 'undefined columns selected' or 'variable lengths differ (found for 'F')' error
+
+dat <- ggpredict(lrs.wGLMER, term = c("windBIRTHyr","lifespan"), bias_correction = T)
+
+print(dat, n=10)
+dat <- as.data.frame(dat)
+write.csv(dat, "lrsMARGeffsELenvLIFESPAN.csv", row.names = F)
+#lifespan: 3.5
+#
+#windBIRTHyr | Predicted |      95% CI
+#-------------------------------------
+#      -3.23 |      1.44 | 1.17,  2.29
+#      -1.91 |      1.93 | 1.84,  2.60
+#      -1.55 |      2.08 | 2.01,  2.79
+#      -1.25 |      2.23 | 2.13,  3.01
+#      -1.08 |      2.31 | 2.18,  3.16
+#       0.61 |      3.34 | 2.50,  5.76
+#
+#lifespan: 6.4
+#
+#windBIRTHyr | Predicted |      95% CI
+#-------------------------------------
+#      -3.23 |      3.57 | 3.21,  5.11
+#      -1.91 |      3.89 | 3.85,  5.07
+#      -1.55 |      3.98 | 3.97,  5.16
+#      -1.25 |      4.07 | 4.04,  5.28
+#      -1.08 |      4.11 | 4.07,  5.36
+#       0.61 |      4.59 | 3.99,  6.82
+#
+#lifespan: 9.3
+#
+#windBIRTHyr | Predicted |      95% CI
+#-------------------------------------
+#      -3.23 |      8.81 | 7.04, 14.23
+#      -1.91 |      7.85 | 7.41, 10.74
+#      -1.55 |      7.61 | 7.41, 10.09
+#      -1.25 |      7.41 | 7.33,  9.68
+#      -1.08 |      7.31 | 7.23,  9.52
+#       0.61 |      6.31 | 5.36,  9.59
+#
+#Adjusted for:
+#*        lrs = 4.00
+#*    MORPH01 = 0.16
+#*      SEX01 = 0.54
+#* nacimiento = 0 (population-level)
+
+
+datL <- ggpredict(lrs.wGLMER, term = c("lifespan"), bias_correction = T)
+datL
+#lifespan | Predicted |       95% CI
+#-----------------------------------
+#    2.00 |   1   1.43 |  1.33,  1.98  
+#    3.00 |   2   1.80 |  1.71,  2.43
+#    5.00 |   3   2.85 |  2.82,  3.73
+#    7.00 |   5   4.53 |  4.50,  5.89
+#    8.00 |   6   5.71 |  5.62,  7.49
+#    9.00 |   7   7.20 |  6.97,  9.59
+#   11.00 |   11  11.42 | 10.56, 15.94
+#   14.00 |   23  22.86 | 19.39, 34.75
+#
+#Adjusted for:
+#*         lrs =  4.00
+#* windBIRTHyr = -1.70
+#*     MORPH01 =  0.16
+#*       SEX01 =  0.54
+#*  nacimiento = 0 (population-level)
+
+dat2 <- ggpredict(lrs.wGLMER, term = c("MORPH01"), bias_correction = T)
+dat2
+#MORPH01 | Predicted |     95% CI
+#--------------------------------
+#      0 |      3.77 | 3.73, 4.91
+#      1 |      4.74 | 4.29, 6.74
+```
+
+
+Model run with both sexes and censored last birth year 2018
+
+
+```{r bootstrapped coef and p-values cens}
+
+EFlrscompleteCENS<-EFlrsCENS[complete.cases(EFlrsCENS[,c(1:6)]),]
+
+range(EFlrscompleteCENS$windBIRTHyr)
+
+lrs.wGLMERcens <- glmer.nb(lrs ~
+    scale(windBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+  scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+     (1|nacimiento), data=EFlrscompleteCENS,nAGQ=1, 
+    glmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                 optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)))
+
+#run takes ~20min.
+mcmc.fixed <- bootMer(lrs.wGLMERcens, FUN=fixef, nsim=1000, type="parametric", seed=1)
+coef.mcmc.fixed <- as.data.frame(mcmc.fixed$t)
+table_mc <- psych::describe(coef.mcmc.fixed)
+colnames(table_mc)[4] <- "SE"
+table_mc$Zeta <- table_mc$mean / table_mc$SE
+table_mc$p_boot <- round(2*pnorm(abs(table_mc$Zeta), lower.tail=FALSE), 5)
+table_mc$coef.model <- round(fixef(lrs.wGLMERcens), 5)
+print(table_mc, digits=5)
+
+#                                                                                                                      vars    n     mean      SE   median  trimmed     mad      min     max   range     skew kurtosis      se     Zeta  p_boot coef.model
+#(Intercept)                                                                                                             1 1000  1.52578 0.06956  1.52643  1.52601 0.06795  1.28166 1.71550 0.43385 -0.06454 -0.11117 0.00220 21.93463 0.00000    1.54033
+#scale(windBIRTHyr, scale = T, center = T)                                                                               2 1000  0.08602 0.05851  0.08769  0.08667 0.05996 -0.08218 0.24363 0.32580 -0.11283 -0.23536 0.00185  1.47005 0.14155    0.08953
+#scale(MORPH01, scale = F, center = T)                                                                                   3 1000  0.25138 0.12754  0.24892  0.25132 0.12891 -0.11421 0.62267 0.73688  0.01062 -0.16292 0.00403  1.97094 0.04873    0.25886
+#scale(SEX01, scale = F, center = T)                                                                                     4 1000 -0.03192 0.10166 -0.03213 -0.03199 0.10076 -0.35442 0.30493 0.65935  0.00925  0.03947 0.00321 -0.31402 0.75351   -0.03381
+#scale(lifespan, scale = T, center = T)                                                                                  5 1000  0.56162 0.05283  0.56178  0.56151 0.05200  0.35286 0.71716 0.36430 -0.00638  0.02712 0.00167 10.63040 0.00000    0.55455
+#scale(windBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T)                                         6 1000  0.16636 0.12235  0.16783  0.16644 0.11855 -0.30574 0.57852 0.88426 -0.05410  0.24843 0.00387  1.35972 0.17392    0.16867
+#scale(windBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T)                                           7 1000  0.01177 0.10120  0.00955  0.01202 0.10706 -0.30736 0.32442 0.63177 -0.02471 -0.13677 0.00320  0.11631 0.90741    0.01019
+#scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)                                               8 1000  0.23282 0.23559  0.22581  0.22731 0.23053 -0.51125 1.06034 1.57159  0.19659  0.04888 0.00745  0.98824 0.32304    0.20114
+#scale(windBIRTHyr, scale = T, center = T):scale(lifespan, scale = T, center = T)                                        9 1000 -0.14890 0.05953 -0.14918 -0.14935 0.05714 -0.32526 0.07671 0.40197  0.10206  0.21555 0.00188 -2.50148 0.01237   -0.15411
+#scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T)                                             10 1000  0.18183 0.10048  0.18022  0.18160 0.09751 -0.13408 0.52669 0.66077  0.04697 -0.01852 0.00318  1.80957 0.07036    0.17591
+#scale(windBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)    11 1000  0.01328 0.23777  0.02316  0.01689 0.23148 -0.91323 0.74527 1.65850 -0.18333  0.19225 0.00752  0.05585 0.95546   -0.01388
+#scale(windBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T)   12 1000 -0.04204 0.11132 -0.04579 -0.04307 0.11482 -0.36396 0.27455 0.63851  0.07225 -0.24459 0.00352 -0.37769 0.70566   -0.04597                                                                                           
+```
+
+
+```{r exporting LRS model table fm winds censored}
+
+    
+sjPlot::tab_model(lrs.wGLMERcens, 
+        transform=NULL, show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/lrsFMwindCENS.doc")
+```
+
+
+
+
+```{r model comparison and selection lrs fm prod}
+str(EFlrs) 
+EFlrscomplete<-EFlrs[complete.cases(EFlrs[,c(1:6)]),]
+str(EFlrscomplete)
+
+EFlrsM <- subset(EFlrscomplete, Sexo=="M")
+EFlrsF <- subset(EFlrscomplete, Sexo=="H")
+
+tapply(EFlrsM$lrs, EFlrsM$Morph, range)
+#$B
+#[1]  0 20
+#$N
+#[1]  0 12
+summary(EFlrsM$Morph)
+#B     N 
+#113  29
+EFlrsM$lifespanF <- as.factor(EFlrsM$lifespan)
+summary(EFlrsM$lifespanF)
+#   2  3  4  5  6  7  8  9 10 11 12 13 14 
+#   1 16 27 16 22 21  9 10  9  1  2  7  1  
+
+
+tapply(EFlrsF$lrs, EFlrsF$Morph, range)
+#$B
+#[1]  0 15
+#
+#$N
+#[1]  0 15
+summary(EFlrsF$Morph)
+#B     N 
+#106  12
+EFlrsF$lifespanF <- as.factor(EFlrsF$lifespan)
+summary(EFlrsF$lifespanF)
+#   2  3  4  5  6  7  8  9 10 11 12 13 14 
+#   8 15 15 17 19 10  8  6  5  5  3  5  2
+
+
+options(contrasts=c(factor="contr.sum", ordered="contr.poly"))
+control.tmb <- glmmTMBControl(optCtrl=list(iter.max=5e3, eval.max=5e3), 
+                profile=T,parallel=10)
+control.tmb2 <- glmmTMBControl(optCtrl=list(iter.max=5000, eval.max=5000), parallel=10)
+
+
+
+tmb.1.p <- glmmTMB(lrs ~
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), REML=FALSE, data=EFlrscomplete, control=control.tmb2,
+                 family=poisson(link="log"))
+#
+tmb.1.cpg <- glmmTMB(lrs ~
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)++
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento),REML=FALSE, data=EFlrscomplete, control=control.tmb2,
+                 family=compois(link="log"))
+#
+tmb.1.nb <- glmmTMB(lrs ~
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), REML=FALSE, data=EFlrscomplete, control=control.tmb2,
+                 family=nbinom2(link="log"))
+# 
+tmb.1.pg <- glmmTMB(lrs ~
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento),REML=FALSE, data=EFlrscomplete, control=control.tmb2,
+                 family=genpois(link="log"))
+# 
+tmb.1.tw <- glmmTMB(lrs ~
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), REML=FALSE,data=EFlrscomplete,   
+                  control=control.tmb,
+                 family=tweedie(link="log"))
+# 
+#Warning in fitTMB(TMBStruc) :Model convergence problem; false convergence (8). See vignette('troubleshooting')
+tmb.1.p.z <- glmmTMB(lrs ~scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=poisson(link="log"))
+# Warning
+tmb.1.pg.z <- glmmTMB(lrs ~scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=genpois(link="log"))
+# Warning
+tmb.1.nb.z <- glmmTMB(lrs ~scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=nbinom2(link="log"))
+# Warning
+tmb.1.tw.z <- glmmTMB(lrs ~scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento),ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=tweedie(link="log"))
+# Warning
+tmb.1.p.h <- glmmTMB(lrs ~scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)+
+                 scale(windBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=truncated_poisson(link="log"))
+#
+tmb.1.pg.h <- glmmTMB(lrs ~
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=truncated_genpois(link="log"))
+#
+tmb.1.nb.h <- glmmTMB(lrs ~
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+                 scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+                 (1|nacimiento), ziformula=~., REML=FALSE, data=EFlrscomplete, control=control.tmb,
+                 family=truncated_nbinom2(link="log"))
+# 
+val_AICc <- MuMIn::AICc(tmb.1.p, tmb.1.cpg, tmb.1.nb, tmb.1.pg,tmb.1.p.h, tmb.1.pg.h, tmb.1.nb.h)
+
+val_AICc
+#           df     AICc
+#tmb.1.p     13 1106.832
+#tmb.1.cpg  14 1100.162
+#tmb.1.nb   14 1097.436
+#tmb.1.pg   14 1100.955
+#tmb.1.p.h  14 1108.179
+#tmb.1.pg.h 27 1118.306
+#tmb.1.nb.h 27 1116.564
+Weights(na.omit(val_AICc)) # 0.006 0.177 0.694 0.119 0.003 0.000 0.000
+
+## only evaluated models that did not give warning
+
+
+## model selection
+modelMFp <- tmb.1.nb
+
+
+
+```
+
+
+```{r model residuals lrs fm prod}
+
+res.devian <- residuals(modelMFw, type="pearson")   
+##  DHARMa standardised resid 0-1
+res.dharma <- simulateResiduals(modelMFw)$scaledResiduals
+plot(res.devian, res.dharma)
+plot(rank(res.devian), res.dharma)
+
+##  GLOBAL DIAGNOSIS 
+testUniformity(modelMFw) #normality
+#D = 0.046261, p-value = 0.6364
+testQuantiles(modelMFw) #heteroscedasticity
+#p-value = 0.398
+testOutliers(modelMFw) 
+#none
+testZeroInflation(modelMFw)
+#no inflation     ratioObsSim = 0.96198, p-value = 0.992
+
+##   plots all at once
+plot(simulateResiduals(modelMFw))
+
+##   only for Poisson or binomial; has to be close to 1
+testDispersion(modelMFw) #dispersion =  0.90301, p-value = 0.76
+##  there is no dispersion but if there were, it can be corrected with argument dispformula
+
+check_collinearity(modelMFw) 
+DF <- Anova(modelMFw, type=3)[2]
+check_collinearity(modelMFw)$VIF^(1/(2*DF)) 
+
+# 
+#                                                                                                                     DF
+#(Intercept)                                                                                                          1.057224
+#scale(windBIRTHyr, scale = T, center = T)                                                                            1.134035
+#scale(MORPH01, scale = F, center = T)                                                                                1.175269
+#scale(SEX01, scale = F, center = T)                                                                                  1.246908
+#scale(lifespan, scale = T, center = T)                                                                               1.105377
+#scale(windBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T)                                      1.123685
+#scale(windBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T)                                        1.138450
+#scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)                                            1.376638
+#scale(windBIRTHyr, scale = T, center = T):scale(lifespan, scale = T, center = T)                                     1.306983
+#scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T)                                           1.109077
+#scale(windBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)  1.474649
+#scale(windBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T) 1.057224
+
+```
+
+```{r model results lrs fm prod GLMMTMB}
+summary(modelMFp)$coefficients
+
+summary(modelMFp)
+
+#     AIC      BIC   logLik deviance df.resid 
+#   1097.8    1147.6    -534.9    1069.8       245 
+#
+#Random effects:
+#
+#Conditional model:
+# Groups     Name        Variance  Std.Dev. 
+# nacimiento (Intercept) 0.01348  0.1161  
+#Number of obs: 259, groups:  nacimiento, 12
+#
+#Dispersion parameter for genpois family ():  12.7 
+
+round(confint(modelMw, level=0.95, method="Wald"), 3)
+##  transform to get response coeff
+round(exp(confint(modelMFw, level=0.95, method="Wald")), 3)  
+## BOOTSTRAP 
+set.seed(111)
+model.bootstrap <- bootstrap_parameters(modelMw, ci=0.95, iterations=1000, centrality="median", 
+                                         test=c("p_direction", "p_map", "p-value"), ci_method=c("BCI"))
+model.bootstrap
+
+
+Anova(modelMFw, type=3)    ## equivalente a SS de tipo III 
+## use this for fixed effects (not for interactions) 
+##   
+drop1(modelMFw, test="Chisq") 
+## use this for interactions)
+summary(modelMw)$varcor
+summary(modelMw)$sigma    ## sd for residual error
+summary(update(modelMw, REML=TRUE))$varcor
+summary(update(modelMw, REML=TRUE))$sigma
+
+## random eff test
+formula(modelMw)
+model.nomix <- update(modelMw, .~.-(1|nacimiento), REML=F)
+anova(model.nomix, modelMw)
+
+```
+
+```{r bootstrapped coef and p-values prod}
+range(EFlrscomplete$windBIRTHyr)
+
+lrs.pGLMER <- glmer.nb(lrs ~
+    scale(prodBIRTHyr, scale=T, center=T)*scale(MORPH01, scale=F, center=T)*scale(SEX01, scale=F, center=T)+
+  scale(prodBIRTHyr, scale=T, center=T)*scale(lifespan, scale=T, center=T)*scale(SEX01, scale=F, center=T)+
+     (1|nacimiento), data=EFlrscomplete,nAGQ=1, 
+    glmerControl(check.conv.grad=.makeCC(action ="ignore", tol=1e-6, relTol=NULL),
+                                 optimizer= "Nelder_Mead", optCtrl=list(maxfun=1e9)))
+
+#run takes ~20min.
+mcmc.fixed <- bootMer(lrs.pGLMER, FUN=fixef, nsim=1000, type="parametric", seed=1)
+coef.mcmc.fixed <- as.data.frame(mcmc.fixed$t)
+table_mc <- describe(coef.mcmc.fixed)[,c(1:4,11:12)]
+colnames(table_mc)[4] <- "SE"
+table_mc$Zeta <- table_mc$mean / table_mc$SE
+table_mc$p_boot <- round(2*pnorm(abs(table_mc$Zeta), lower.tail=FALSE), 5)
+table_mc$coef.model <- round(fixef(lrs.wGLMER), 5)
+print(table_mc, digits=5)
+
+#                                                                                                                     vars    n     mean      SE     skew kurtosis     Zeta  p_boot coef.model
+#(Intercept)                                                                                                             1 1000  1.17472 0.06440 -0.12443  0.06113 18.24192 0.00000    1.23337
+#scale(prodBIRTHyr, scale = T, center = T)                                                                               2 1000 -0.11051 0.06017 -0.02658 -0.00268 -1.83660 0.06627    0.07127
+#scale(MORPH01, scale = F, center = T)                                                                                   3 1000  0.22047 0.10818 -0.27563  0.10760  2.03798 0.04155    0.22833
+#scale(SEX01, scale = F, center = T)                                                                                     4 1000 -0.00461 0.08320  0.01807 -0.11904 -0.05538 0.95584   -0.04581
+#scale(lifespan, scale = T, center = T)                                                                                  5 1000  0.61302 0.04172 -0.11918  0.13058 14.69514 0.00000    0.66906
+#scale(prodBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T)                                         6 1000  0.00911 0.09765  0.07916 -0.01285  0.09332 0.92565    0.05655
+#scale(prodBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T)                                           7 1000  0.00375 0.08373  0.09291 -0.30184  0.04476 0.96430   -0.01087
+#scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)                                               8 1000  0.05936 0.19174  0.20235  0.74258  0.30961 0.75686    0.02441
+#scale(prodBIRTHyr, scale = T, center = T):scale(lifespan, scale = T, center = T)                                        9 1000  0.13318 0.04403  0.08584 -0.33168  3.02510 0.00249   -0.15845
+#scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T)                                             10 1000  0.12932 0.07282 -0.00345  0.02402  1.77582 0.07576    0.08322
+#scale(prodBIRTHyr, scale = T, center = T):scale(MORPH01, scale = F, center = T):scale(SEX01, scale = F, center = T)    11 1000 -0.07507 0.18470 -0.08447  0.26547 -0.40645 0.68441    0.07887
+#scale(prodBIRTHyr, scale = T, center = T):scale(SEX01, scale = F, center = T):scale(lifespan, scale = T, center = T)   12 1000  0.05541 0.07236  0.11836 -0.04427  0.76570 0.44385    0.04968
+```
+
+
+```{r exporting LRS model table fm prod}
+
+    
+sjPlot::tab_model(lrs.pGLMER, 
+        transform=NULL, show.ci = F, show.se = T, show.r2=T, show.stat = T,file = "~/Desktop/lrsFMprod.doc")
+```
+
+
+
+### GRAPHS LRS -------
+
+
+```{r LRS and morph }
+
+p <- ggplot(EFlrscomplete, aes(x=Morph, y=lrs, fill=Morph)) + 
+  geom_boxplot(notch=T, outlier.colour="white",)+
+  geom_jitter(data=subset(EFlrscomplete,Morph=="N"), 
+                  aes(x=Morph, y=lrs),shape=21, 
+                  position=position_jitter(0.2),
+                  size=3.5, fill="#000000", colour="black")+
+  geom_jitter(data=subset(EFlrscomplete,Morph=="B"), 
+                  aes(x=Morph, y=lrs),shape=21, 
+                  position=position_jitter(0.2),
+                  size=3, fill="white", colour="black")+
+  theme(axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size=30),
+        axis.title.y = element_text(size=30, vjust=0.3),
+        axis.text.x=element_text(size=26,margin =margin(10,0,20,0)),
+        axis.text.y=element_text(size=26, margin =margin(0,10,0,20)),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.position = "none")+
+  labs(x="Morph",
+       y="Lifetime reproductive success (no. of fledglings)") +
+  scale_fill_manual(values=c("#CCCCCC", "#999999"))+
+  scale_x_discrete(breaks=c("B","N"),
+        labels=c("pale", "dark"))
+p
+ggsave("fm_LRS morph.png", width=32, height=26, unit="cm", dpi=600)
+
+
+```
