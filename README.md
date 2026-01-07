@@ -8,7 +8,7 @@ Authors: Badás, Elisa P; Duarte S. Viana, Jordi Figuerola & Laura Gangoso
 
 Published in: Behavioral Ecology
 
-DOI:
+DOI: tbc
 
 This repository consists of an R markdown file containing the code for the statistical analyses and graphs found in the scientific paper, an R project, and the datasets used. Note that the names of the columns in the datasets may vary from what is found in the code in the Rmd file. Please adjust as necessary.
 
