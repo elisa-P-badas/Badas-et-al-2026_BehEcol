@@ -6,7 +6,7 @@ Title: Reproductive senescence in a polymorphic raptor: phenotypic, sex and envi
 
 Authors: Badás, Elisa P; Duarte S. Viana, Jordi Figuerola & Laura Gangoso
 
-Published in: Behavioral Ecology
+Currently under review in: Behavioral Ecology
 
 DOI: tbc
 
